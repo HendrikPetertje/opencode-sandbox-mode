@@ -17,7 +17,7 @@ per-project and global allow/block lists.
   [bubblewrap](https://github.com/containers/bubblewrap) (`apt install bubblewrap`)
 - A Nerd Font in your terminal, for the icons
 - Optional: the [auto-mode](https://github.com/HendrikPetertje/opencode-auto-mode)
-  plugin (see [Files outside the project](#files-outside-the-project))
+  plugin, which supports sandbox-mode (see [Works with auto-mode](#works-with-auto-mode))
 
 ## Installation
 
@@ -168,15 +168,30 @@ Commands in the sandbox see `OPENCODE_SANDBOX=seatbelt` (or `bubblewrap`).
 
 ### Files outside the project
 
-While the sandbox is on:
+The sandbox only contains shell commands. OpenCode's file tools (`read`,
+`edit`, `write`, …) run outside it, so for those it depends on whether
+auto-mode is loaded; see [Works with auto-mode](#works-with-auto-mode).
+Without auto-mode, or with auto-mode off, OpenCode's own
+`external_directory` rules apply unchanged.
 
-- With [auto-mode](https://github.com/HendrikPetertje/opencode-auto-mode)
-  loaded and on, file tools (`read`, `edit`, …) that reach outside the project
-  always ask you. Shell commands are still reviewed, and the reviewer is told
-  the project is sandboxed, so it asks you about anything that reaches
-  outside. It only denies what it would deny anyway.
-- Without auto-mode, or with it off, OpenCode's own `external_directory`
-  rules apply unchanged.
+## Works with auto-mode
+
+[auto-mode](https://github.com/HendrikPetertje/opencode-auto-mode) supports
+sandbox-mode. When both are loaded and the sandbox is on for a project:
+
+- **File tools reaching outside the project always ask you.** auto-mode
+  doesn't review them or allow them on its own.
+- **Shell commands are still reviewed.** The reviewer is told the project is
+  sandboxed, so it asks you about anything that reads or changes things
+  outside the project. It only denies what it would deny anyway. MCP tools
+  (memory, docs, …) are reviewed as usual.
+- **Sandbox denies stand.** When the sandbox refuses a `webfetch` host,
+  auto-mode doesn't override it.
+- **Its log says why.** These decisions show up with the source `sandbox`
+  in auto-mode's modal and log.
+
+Nothing to configure: auto-mode picks this up as soon as both plugins are
+loaded. With auto-mode turned off, OpenCode's own rules apply.
 
 ### When the sandbox can't start
 
@@ -234,6 +249,9 @@ A new session checks again.
   OpenCode itself aren't.
 
 ## Files
+
+**Open state folder** in the settings modal opens this folder in Finder (or
+your file manager on Linux).
 
 - `~/.local/state/opencode-sandbox-mode/projects/<hash>.json`: a project's
   settings and lists

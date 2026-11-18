@@ -6,6 +6,10 @@ import { Plugin, usePlugin } from "@opencode/plugin/tui";
 import { RGBA, TextAttributes } from "@opentui/core";
 import { useTerminalDimensions } from "@opentui/solid";
 import { createEffect, createRoot, createSignal, on as track } from "solid-js";
+import { spawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { stateDir } from "./src/paths.ts";
 import type { ProjectSettings, SettingRow } from "./src/options.ts";
 import { isValid } from "./src/patterns.ts";
 import { SandboxMode } from "./src/rpc.ts";
@@ -87,6 +91,23 @@ const listKey = (row: SettingRow["key"]): ListView | undefined => {
   return match ? { scope: match[1] as ListView["scope"], kind: match[2] as ListView["kind"] } : undefined;
 };
 const listTitle = (view: ListView) => `${view.scope === "project" ? "Project" : "Global"} ${view.kind === "allow" ? "allowlist" : "blocklist"}`;
+
+/** The state folder as shown in settings, with the home folder as `~`. */
+function stateFolderLabel(): string {
+  const dir = stateDir();
+  const home = homedir();
+  return dir.startsWith(`${home}/`) ? `~/${dir.slice(home.length + 1)}` : dir;
+}
+
+/** Opens the state folder in the OS file manager (Finder on macOS). */
+function openStateFolder(): void {
+  const dir = stateDir();
+  try {
+    mkdirSync(dir, { recursive: true });
+    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "explorer" : "xdg-open";
+    spawn(opener, [dir], { detached: true, stdio: "ignore" }).on("error", () => {}).unref();
+  } catch {}
+}
 
 export default Plugin.define({
   id: "sandbox-mode.tui",
@@ -257,6 +278,7 @@ export default Plugin.define({
       const change = (step: -1 | 1) => {
         const setting = state()?.rows[row()];
         if (!setting) return;
+        if (setting.key === "openState") return step === 1 ? openStateFolder() : undefined;
         const list = listKey(setting.key);
         if (list) return step === 1 ? openList(list) : undefined;
         void call("setSetting", props.sessionID, { key: setting.key, step });
@@ -333,6 +355,8 @@ export default Plugin.define({
             },
           },
           { bind: "shift+g", run: () => move(100000) },
+          { bind: "home", run: () => move(-100000) },
+          { bind: "end", run: () => move(100000) },
           { bind: "h", run: () => (view() ? back() : change(-1)) },
           { bind: "left", run: () => (view() ? back() : change(-1)) },
           { bind: "l", run: () => (view() ? false : change(1)) },
@@ -367,6 +391,7 @@ export default Plugin.define({
 
       const on = () => state()?.enabled ?? false;
       const valueText = (setting: SettingRow) => {
+        if (setting.key === "openState") return stateFolderLabel();
         const list = listKey(setting.key);
         if (list) {
           const count = state()?.lists[list.scope][list.kind].length ?? 0;
@@ -378,7 +403,7 @@ export default Plugin.define({
         return typeof value === "boolean" ? (value ? "on" : "off") : String(value);
       };
       const valueColor = (setting: SettingRow) => {
-        if (listKey(setting.key)) return COLOR.iris;
+        if (setting.key === "openState" || listKey(setting.key)) return COLOR.iris;
         const value = state()?.settings[setting.key as keyof ProjectSettings];
         if (typeof value === "boolean") return value ? COLOR.foam : COLOR.muted;
         return VALUE_COLOR[String(value)] ?? COLOR.gold;
@@ -398,7 +423,7 @@ export default Plugin.define({
               }}
             >
               <text fg={COLOR.muted as any}>{index < 9 ? `${index + 1}` : " "}</text>
-              <text fg={(listKey(setting.key) ? COLOR.iris : ctx.theme.text.base) as any} width={20}>
+              <text fg={(listKey(setting.key) || setting.key === "openState" ? COLOR.iris : ctx.theme.text.base) as any} width={20}>
                 {setting.label}
               </text>
               <text fg={(on() ? valueColor(setting) : COLOR.muted) as any} attributes={TextAttributes.BOLD}>

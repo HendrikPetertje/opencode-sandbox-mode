@@ -79,7 +79,7 @@ export function parseOptions(raw: Record<string, unknown> | undefined): Options 
 export type SettingKey = Exclude<keyof ProjectSettings, "enabled">;
 
 export interface SettingRow {
-  key: SettingKey | "list:project:allow" | "list:project:deny" | "list:global:allow" | "list:global:deny";
+  key: SettingKey | "list:project:allow" | "list:project:deny" | "list:global:allow" | "list:global:deny" | "openState";
   label: string;
   description: string;
 }
@@ -96,6 +96,7 @@ export const SETTING_ROWS: SettingRow[] = [
   { key: "list:project:deny", label: "Project blocklist", description: "Regexes on host:port this project may never connect to" },
   { key: "list:global:allow", label: "Global allowlist", description: "Allowed in every project" },
   { key: "list:global:deny", label: "Global blocklist", description: "Blocked in every project" },
+  { key: "openState", label: "Open state folder", description: "Settings, lists, sandbox homes and sandbox.log; opens in your file manager" },
 ];
 
 export function adjust(settings: ProjectSettings, key: SettingKey, step: -1 | 1): ProjectSettings {
