@@ -14,7 +14,8 @@ per-project and global allow/block lists.
 
 - OpenCode V2
 - macOS (Seatbelt ships with the OS), or Linux with
-  [bubblewrap](https://github.com/containers/bubblewrap) (`apt install bubblewrap`)
+  [bubblewrap](https://github.com/containers/bubblewrap) (`apt install bubblewrap`).
+  Ask mode on Linux also needs `python3` or `node` (see [Linux](#linux)).
 - A Nerd Font in your terminal, for the icons
 - Optional: the [auto-mode](https://github.com/HendrikPetertje/opencode-auto-mode)
   plugin, which supports sandbox-mode (see [Works with auto-mode](#works-with-auto-mode))
@@ -66,7 +67,6 @@ whatever you last picked in the TUI.
 | `gg` / `G` | top / bottom |
 | `h` / `l` | change the setting |
 | `space` / `enter` | change the setting, or open a list |
-| `1`–`9` | jump to a row and change it |
 | `-` | sandbox on / off (the power button, bottom right) |
 | `?` | all shortcuts |
 | `esc` | close |
@@ -158,13 +158,30 @@ on closed, it's denied. MCP servers and `websearch` aren't covered.
 | --- | --- | --- |
 | Network out | `ask` | `open`: no limits. `ask`: only the plugin's proxy is reachable, and it asks per host. `closed`: no network, lists are ignored |
 | Network in | `closed` | Commands can't listen on ports |
-| Localhost | on | With network out on ask or closed, connections to this machine (dev servers, databases) still work |
+| Localhost | on | With network out on ask or closed, connections to this machine (dev servers, databases) still work (macOS only) |
 | Project-only writes | on | Writes only inside the project, the temp folders, the sandbox home and `extraWritePaths` |
 | Sandbox home | on | `HOME` is an empty per-project folder under `~/.local/state/opencode-sandbox-mode/homes/` |
 | Protect hooks | on | `.git/hooks`, `.git/config`, `.opencode` and `.envrc` are read-only |
 | Block credentials | on | `credentialPaths` can't be read or written |
 
 Commands in the sandbox see `OPENCODE_SANDBOX=seatbelt` (or `bubblewrap`).
+
+### Linux
+
+bubblewrap gives the sandbox its own network namespace instead of filtering
+connections, which changes a few things:
+
+- **Network in and out change together.** With network out on open, the
+  sandbox shares the machine's network both ways. With ask or closed, it has
+  no network, so nothing can connect in either. Changing one setting changes
+  the other, and the modal explains this under the list.
+- **Localhost is the sandbox's own.** Dev servers and databases on the
+  machine aren't reachable with network out on ask or closed, so the
+  Localhost setting doesn't apply.
+- **Ask mode uses a bridge.** The proxy also listens on a unix socket that's
+  mounted into the sandbox. A small forwarder inside the sandbox, run with
+  `python3` or `node` (whichever the machine has), connects the proxy port
+  to it. With neither installed, ask acts as closed and the modal says so.
 
 ### Files outside the project
 
@@ -232,11 +249,8 @@ A new session checks again.
 - **Ask only covers proxy-aware tools.** The sandbox sets `HTTP(S)_PROXY`,
   `ALL_PROXY` (SOCKS5) and their lowercase forms. Tools that ignore them can't
   reach the network at all; nothing gets past without being checked.
-- **Linux: ask acts as closed.** bubblewrap has no route to the host's
-  proxy yet, so ask blocks all network for now. Also, network in can't be
-  blocked while network out is open.
-- **Unix sockets stay open**, for DNS and local services. That includes the
-  podman/docker socket, if your user can reach it.
+- **Unix sockets stay open on macOS**, for DNS and local services. That
+  includes the podman/docker socket, if your user can reach it.
 - **Seatbelt is deprecated by Apple.** It still works and is what Chromium and
   Claude Code use. Some tools (browsers, podman) need extra paths or don't
   work in it.
@@ -257,6 +271,8 @@ your file manager on Linux).
   settings and lists
 - `~/.local/state/opencode-sandbox-mode/global.json`: the global lists
 - `~/.local/state/opencode-sandbox-mode/homes/<hash>/`: sandbox homes
+- `~/.local/state/opencode-sandbox-mode/run/<hash>/` (Linux): a session's
+  proxy socket and forwarder, removed when the session's sandbox is released
 - `~/.local/state/opencode-sandbox-mode/sandbox.log`: Ask popups, answers,
   timeouts and errors, for troubleshooting
 

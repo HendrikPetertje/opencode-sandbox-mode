@@ -36,6 +36,15 @@ describe("options", () => {
     expect(adjust(settings, "networkOut", -1).networkOut).toBe("open");
     expect(adjust(settings, "localhost", 1).localhost).toBe(!settings.localhost);
   });
+  test("linked network moves in and out together", () => {
+    const open = adjust(settings, "networkOut", -1, true);
+    expect(open).toMatchObject({ networkOut: "open", networkIn: "open" });
+    expect(adjust(open, "networkOut", 1, true)).toMatchObject({ networkOut: "ask", networkIn: "closed" });
+    expect(adjust(open, "networkIn", 1, true)).toMatchObject({ networkOut: "ask", networkIn: "closed" });
+    const closed = { ...settings, networkOut: "closed" as const, networkIn: "closed" as const };
+    expect(adjust(closed, "networkIn", 1, true)).toMatchObject({ networkOut: "open", networkIn: "open" });
+    expect(adjust(adjust(closed, "networkIn", 1, true), "networkIn", 1, true)).toMatchObject({ networkOut: "ask", networkIn: "closed" });
+  });
 });
 
 const spec = (overrides: Partial<Spec> = {}): Spec => ({

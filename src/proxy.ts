@@ -3,6 +3,7 @@
  * this proxy, and the proxy decides per `host:port`: HTTP CONNECT (https),
  * plain HTTP with an absolute URL, and SOCKS5 (for ALL_PROXY users).
  */
+import { rmSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 
 export type Decide = (target: string) => Promise<boolean>;
@@ -149,9 +150,14 @@ function handleSocks(client: Socket, first: Buffer, decide: Decide): void {
   void onData();
 }
 
-export function startProxy(decide: Decide): Promise<Proxy> {
+/**
+ * Listens on a random 127.0.0.1 port, and also on `unixPath` when given: on
+ * Linux the sandbox has its own network namespace and reaches the proxy
+ * through that socket (see bridge.ts).
+ */
+export function startProxy(decide: Decide, unixPath?: string): Promise<Proxy> {
   const sockets = new Set<Socket>();
-  const server: Server = createServer((client) => {
+  const handler = (client: Socket) => {
     sockets.add(client);
     client.once("close", () => sockets.delete(client));
     client.on("error", () => {});
@@ -171,19 +177,29 @@ export function startProxy(decide: Decide): Promise<Proxy> {
       if (head.length > HEADER_LIMIT) client.destroy();
     };
     client.on("data", onData);
-  });
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      resolve({
-        port: typeof address === "object" && address ? address.port : 0,
-        close: () =>
-          new Promise<void>((done) => {
-            for (const socket of sockets) socket.destroy();
-            server.close(() => done());
-          }),
-      });
+  };
+  const listen = (server: Server, ...args: unknown[]) =>
+    new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      (server.listen as any)(...args, () => resolve());
     });
-  });
+  const tcp: Server = createServer(handler);
+  const unix: Server | undefined = unixPath ? createServer(handler) : undefined;
+  return (async () => {
+    await listen(tcp, 0, "127.0.0.1");
+    if (unix && unixPath) {
+      rmSync(unixPath, { force: true });
+      await listen(unix, unixPath);
+    }
+    const address = tcp.address();
+    const close = (server: Server) => new Promise<void>((done) => server.close(() => done()));
+    return {
+      port: typeof address === "object" && address ? address.port : 0,
+      close: async () => {
+        for (const socket of sockets) socket.destroy();
+        await Promise.all([close(tcp), unix ? close(unix) : undefined]);
+        if (unixPath) rmSync(unixPath, { force: true });
+      },
+    };
+  })();
 }

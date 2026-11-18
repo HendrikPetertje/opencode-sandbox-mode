@@ -40,6 +40,7 @@ interface Payload {
   problem: string | null;
   backend: string | null;
   askSupported: boolean;
+  linkedNetwork: boolean;
   asks: AskInfo[];
 }
 
@@ -378,17 +379,10 @@ export default Plugin.define({
             },
           },
           { bind: "-", run: toggle },
-          ...Array.from({ length: 9 }, (_, i) => ({
-            bind: String(i + 1),
-            run: () => {
-              if (view() || i >= length()) return false;
-              setRow(i);
-              change(1);
-            },
-          })),
         ],
       }));
 
+      const linked = () => state()?.linkedNetwork ?? false;
       const on = () => state()?.enabled ?? false;
       const valueText = (setting: SettingRow) => {
         if (setting.key === "openState") return stateFolderLabel();
@@ -399,11 +393,15 @@ export default Plugin.define({
           return `${count} ${count === 1 ? "entry" : "entries"}${extra ? ` + ${extra} from config` : ""} ›`;
         }
         const value = state()?.settings[setting.key as keyof ProjectSettings];
-        if (setting.key === "networkOut" && value === "ask" && state() && !state()!.askSupported) return "ask (acts as closed here)";
+        if (setting.key === "networkOut" && value === "ask" && state() && !state()!.askSupported) {
+          return "ask (needs python3 or node; acts as closed)";
+        }
+        if (setting.key === "localhost" && linked()) return "n/a on Linux";
         return typeof value === "boolean" ? (value ? "on" : "off") : String(value);
       };
       const valueColor = (setting: SettingRow) => {
         if (setting.key === "openState" || listKey(setting.key)) return COLOR.iris;
+        if (setting.key === "localhost" && linked()) return COLOR.muted;
         const value = state()?.settings[setting.key as keyof ProjectSettings];
         if (typeof value === "boolean") return value ? COLOR.foam : COLOR.muted;
         return VALUE_COLOR[String(value)] ?? COLOR.gold;
@@ -422,7 +420,6 @@ export default Plugin.define({
                 change(1);
               }}
             >
-              <text fg={COLOR.muted as any}>{index < 9 ? `${index + 1}` : " "}</text>
               <text fg={(listKey(setting.key) || setting.key === "openState" ? COLOR.iris : ctx.theme.text.base) as any} width={20}>
                 {setting.label}
               </text>
@@ -434,6 +431,12 @@ export default Plugin.define({
           <box height={1} flexShrink={0} />
           <text fg={COLOR.muted as any} wrapMode="word">{state()?.rows[row()]?.description ?? ""}</text>
           <box height={1} flexShrink={0} />
+          {linked() && (
+            <text fg={COLOR.muted as any} wrapMode="word">
+              On Linux, network in and out change together: the sandbox gets its own network, which either lets traffic through both
+              ways (open) or not at all (ask, closed). Localhost is the sandbox's own, not this machine's.
+            </text>
+          )}
           {state()?.problem && on() && <text fg={COLOR.love as any} wrapMode="word">{`Sandbox can't start: ${state()!.problem}`}</text>}
           <text fg={COLOR.muted as any}>Settings are remembered for this project.</text>
         </scrollbox>
@@ -470,7 +473,7 @@ export default Plugin.define({
         if (help()) {
           return view()
             ? "j/k move · gg/G top/bottom · e/enter edit · a add · dd remove · p promote to global (project lists) · h back · esc close"
-            : "j/k move · gg/G top/bottom · h/l change · space/enter change or open list · 1-9 jump · - power · esc close";
+            : "j/k move · gg/G top/bottom · h/l change · space/enter change or open list · - power · esc close";
         }
         return view() ? "j/k · e edit · a add · dd remove · h back · ? help" : "j/k · h/l change · enter open · - power · ? help";
       };

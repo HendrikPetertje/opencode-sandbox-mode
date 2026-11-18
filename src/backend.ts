@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { BRIDGE_MOUNT, bridgePrelude, findForwarder, type Forwarder } from "./bridge.ts";
 import type { ProjectSettings } from "./options.ts";
 import { real } from "./paths.ts";
 
@@ -10,8 +11,10 @@ export interface Spec {
   shell: string;
   command: string;
   settings: ProjectSettings;
-  /** Set in "ask" mode: the only outside host the sandbox may reach. */
+  /** Set in "ask" mode: the only outside host the sandbox may reach (inside the sandbox on Linux). */
   proxyPort?: number;
+  /** Linux "ask" mode: the folder with the proxy's unix socket, and the forwarder that serves `proxyPort` from it. */
+  bridge?: { dir: string; port: number; forwarder: Forwarder };
   /** The synthetic home, when that setting is on. */
   home?: string;
   credentialPaths: string[];
@@ -21,8 +24,10 @@ export interface Spec {
 
 export interface Backend {
   name: string;
-  /** Whether the ask mode's proxy can be enforced (Linux needs a socket bridge first). */
-  supportsAsk: boolean;
+  /** Whether "ask" mode works here (Linux needs python3 or node for the bridge). */
+  readonly supportsAsk: boolean;
+  /** Network in and out can't be set apart (Linux: one network namespace covers both). */
+  linkedNetwork: boolean;
   /** Undefined when it works, otherwise why not. */
   probe(): string | undefined;
   wrap(spec: Spec): string;
@@ -77,6 +82,7 @@ const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 export const seatbelt: Backend = {
   name: "seatbelt",
   supportsAsk: true,
+  linkedNetwork: false,
   probe() {
     if (!existsSync(SANDBOX_EXEC)) return `${SANDBOX_EXEC} not found`;
     const result = spawnSync(SANDBOX_EXEC, ["-p", "(version 1)(allow default)", "/usr/bin/true"], { timeout: 5000 });
@@ -119,22 +125,32 @@ export function bwrapArgs(spec: Spec): string[] {
     }
   }
   for (const path of spec.extraReadPaths) if (existsSync(path)) args.push("--ro-bind", path, path);
-  // Without a socket bridge "ask" can't reach the host's proxy, so it behaves like "closed".
+  // Its own network namespace: nothing gets out, and nothing outside can connect in. "ask" goes through the bridge.
   if (settings.networkOut !== "open") args.push("--unshare-net");
+  if (spec.bridge) args.push("--unshare-pid", "--bind", spec.bridge.dir, BRIDGE_MOUNT);
   args.push("--chdir", spec.cwd);
   return args;
 }
 
 export const bwrap: Backend = {
   name: "bubblewrap",
-  supportsAsk: false,
+  // Ask needs an interpreter for the forwarder inside the sandbox.
+  get supportsAsk() {
+    return findForwarder() !== undefined;
+  },
+  linkedNetwork: true,
   probe() {
-    const result = spawnSync("bwrap", ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-net", "true"], { timeout: 5000 });
+    const result = spawnSync("bwrap", ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-net", "--unshare-pid", "true"], {
+      timeout: 5000,
+    });
     if (result.error) return (result.error as NodeJS.ErrnoException).code === "ENOENT" ? "bwrap (bubblewrap) is not installed" : result.error.message;
     return result.status === 0 ? undefined : `bwrap exited with ${result.status}: ${result.stderr?.toString().trim()}`;
   },
   wrap(spec) {
-    return `bwrap ${bwrapArgs(spec).map(quote).join(" ")} ${quote(spec.shell)} -c ${quote(spec.command)}`;
+    const args = bwrapArgs(spec).map(quote).join(" ");
+    if (!spec.bridge) return `bwrap ${args} ${quote(spec.shell)} -c ${quote(spec.command)}`;
+    const prelude = bridgePrelude(spec.bridge.forwarder, spec.bridge.port);
+    return `bwrap ${args} /bin/sh -c ${quote(prelude)} ${quote(spec.shell)} ${quote(spec.command)}`;
   },
 };
 

@@ -99,10 +99,23 @@ export const SETTING_ROWS: SettingRow[] = [
   { key: "openState", label: "Open state folder", description: "Settings, lists, sandbox homes and sandbox.log; opens in your file manager" },
 ];
 
-export function adjust(settings: ProjectSettings, key: SettingKey, step: -1 | 1): ProjectSettings {
+/**
+ * `linked` (Linux): one network namespace decides both directions, so open out means open in, and ask/closed out
+ * means closed in. Changing either moves the other.
+ */
+export function adjust(settings: ProjectSettings, key: SettingKey, step: -1 | 1, linked = false): ProjectSettings {
   const value = settings[key];
   if (typeof value === "boolean") return { ...settings, [key]: !value };
   const values: readonly string[] = key === "networkOut" ? NETWORK_OUT : NETWORK_IN;
   const index = values.indexOf(value);
-  return { ...settings, [key]: values[(index + step + values.length) % values.length] };
+  const next = { ...settings, [key]: values[(index + step + values.length) % values.length] };
+  if (!linked) return next;
+  if (key === "networkOut") return linkNetwork(next);
+  return { ...next, networkOut: next.networkIn === "open" ? "open" : settings.networkOut === "open" ? "ask" : settings.networkOut };
 }
+
+/** Makes network in follow network out, for platforms where they can't differ. */
+export const linkNetwork = (settings: ProjectSettings): ProjectSettings => ({
+  ...settings,
+  networkIn: settings.networkOut === "open" ? "open" : "closed",
+});

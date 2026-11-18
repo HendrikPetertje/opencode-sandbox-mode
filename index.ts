@@ -5,10 +5,11 @@
  * closes or after a while without use. See README.md.
  */
 import { Plugin } from "@opencode/plugin";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { backendFor, type Backend, type Spec } from "./src/backend.ts";
-import { adjust, parseOptions, SETTING_ROWS, type Options, type SettingKey } from "./src/options.ts";
+import { BRIDGE_SOCKET, findForwarder, prepareBridge } from "./src/bridge.ts";
+import { adjust, linkNetwork, parseOptions, SETTING_ROWS, type Options, type SettingKey } from "./src/options.ts";
 import { expandHome, isInside, projectHash, stateDir } from "./src/paths.ts";
 import { exact, isValid, judge } from "./src/patterns.ts";
 import { startProxy, type Proxy } from "./src/proxy.ts";
@@ -125,6 +126,7 @@ export default Plugin.define({
       let state = shared.projects.get(directory);
       if (!state) {
         state = loadProject(directory, shared.options ?? options);
+        if (shared.backend?.linkedNetwork) state.settings = linkNetwork(state.settings);
         shared.projects.set(directory, state);
       }
       return state;
@@ -189,6 +191,7 @@ export default Plugin.define({
       log("runtime.release", { sessionID, reason });
       const proxy = await entry.proxy?.catch(() => undefined);
       await proxy?.close();
+      if (shared.backend?.linkedNetwork) rmSync(bridgeDir(entry), { recursive: true, force: true });
       emit("changed", {});
     };
 
@@ -287,15 +290,29 @@ export default Plugin.define({
       return promise;
     };
 
+    /** Linux: the folder holding this runtime's proxy socket and forwarder, bind-mounted into the sandbox. */
+    const bridgeDir = (entry: Runtime) => join(stateDir(), "run", projectHash(entry.sessionID));
+
     /** Proxies outlive the copy that started them, so they decide through the newest live copy. */
     const proxyFor = (entry: Runtime): Promise<Proxy> => {
       if (!entry.proxy) {
+        let unixPath: string | undefined;
+        const forwarder = shared.backend?.linkedNetwork ? findForwarder() : undefined;
+        if (forwarder) {
+          const dir = bridgeDir(entry);
+          mkdirSync(dir, { recursive: true, mode: 0o700 });
+          prepareBridge(dir, forwarder);
+          unixPath = join(dir, BRIDGE_SOCKET);
+        }
         entry.proxy = startProxy(async (target) => {
           entry.lastUsed = Date.now();
           const copy = latest();
           return copy ? copy.decide(entry.sessionID, target) : false;
+        }, unixPath);
+        entry.proxy.catch((error) => {
+          logError("starting the proxy", error);
+          entry.proxy = undefined;
         });
-        entry.proxy.catch(() => (entry.proxy = undefined));
       }
       return entry.proxy;
     };
@@ -319,6 +336,7 @@ export default Plugin.define({
         problem: shared.problem ?? null,
         backend: shared.backend?.name ?? null,
         askSupported: shared.backend?.supportsAsk ?? false,
+        linkedNetwork: shared.backend?.linkedNetwork ?? false,
         asks: [...shared.asks.values()].filter((ask) => (info ? ask.sessionID === info.rootID : ask.directory === directory)).map(askPayload),
       });
     };
@@ -356,7 +374,7 @@ export default Plugin.define({
         const state = await projectOf(input);
         const key = input?.key as SettingKey;
         if (key in state.settings && key !== ("enabled" as string)) {
-          state.settings = adjust(state.settings, key, input?.step === -1 ? -1 : 1);
+          state.settings = adjust(state.settings, key, input?.step === -1 ? -1 : 1, shared.backend?.linkedNetwork ?? false);
           save(state);
         }
         emit("changed", {});
@@ -512,8 +530,12 @@ export default Plugin.define({
         };
         // Without a session (your own commands) there's nobody to ask: ask mode acts as closed.
         if (settings.networkOut === "ask" && shared.backend.supportsAsk && owner.sessionID) {
-          const proxy = await proxyFor(runtime(owner.sessionID, owner.directory));
+          const entry = runtime(owner.sessionID, owner.directory);
+          const proxy = await proxyFor(entry);
           spec.proxyPort = proxy.port;
+          // Linux: the sandbox's own 127.0.0.1:<port> is served by the forwarder, which talks to the proxy's socket.
+          const forwarder = shared.backend.linkedNetwork ? findForwarder() : undefined;
+          if (forwarder) spec.bridge = { dir: bridgeDir(entry), port: proxy.port, forwarder };
           const url = `http://127.0.0.1:${proxy.port}`;
           for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "npm_config_proxy", "npm_config_https_proxy"]) {
             event.env[name] = url;
