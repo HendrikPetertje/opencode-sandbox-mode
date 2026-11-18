@@ -7,8 +7,9 @@ import { RGBA, TextAttributes } from "@opentui/core";
 import { useTerminalDimensions } from "@opentui/solid";
 import { createEffect, createRoot, createSignal, on as track } from "solid-js";
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { stateDir } from "./src/paths.ts";
 import type { ProjectSettings, SettingRow } from "./src/options.ts";
 import { isValid } from "./src/patterns.ts";
@@ -26,11 +27,11 @@ interface AskInfo {
   target: string;
   command?: string;
   deadline: number;
-  timedOut: boolean;
 }
 
 interface Payload {
   directory: string;
+  rootID: string | null;
   enabled: boolean;
   settings: ProjectSettings;
   rows: SettingRow[];
@@ -100,6 +101,14 @@ function stateFolderLabel(): string {
   return dir.startsWith(`${home}/`) ? `~/${dir.slice(home.length + 1)}` : dir;
 }
 
+/** Popup routing and RPC failures on the TUI side: ~/.local/state/opencode-sandbox-mode/tui.log. */
+function tuiLog(event: string, data: Record<string, unknown>): void {
+  try {
+    mkdirSync(stateDir(), { recursive: true });
+    appendFileSync(join(stateDir(), "tui.log"), `${JSON.stringify({ time: new Date().toISOString(), pid: process.pid, event, ...data })}\n`);
+  } catch {}
+}
+
 /** Opens the state folder in the OS file manager (Finder on macOS). */
 function openStateFolder(): void {
   const dir = stateDir();
@@ -124,18 +133,42 @@ export default Plugin.define({
     const key = (sessionID: string | undefined) => sessionID ?? "home";
     const directory = () => context.location?.directory ?? context.data.location.default()?.directory;
 
+    /**
+     * Popups follow the server: its `state` lists the open asks of the session's root (so subagent sessions show their
+     * root's asks too). New ones are queued and announced; answered or timed-out ones disappear.
+     */
+    const syncAsks = (payload: Payload) => {
+      const open = payload.asks ?? [];
+      const fresh = open.filter((ask) => !store.asks.some((entry) => entry.id === ask.id));
+      const gone = store.asks.filter((entry) => entry.sessionID === payload.rootID && !open.some((ask) => ask.id === entry.id));
+      if (fresh.length === 0 && gone.length === 0) return;
+      tuiLog("asks", { rootID: payload.rootID, fresh: fresh.map((ask) => ask.id), gone: gone.map((ask) => ask.id) });
+      update((draft) => {
+        draft.asks = draft.asks.filter((entry) => !gone.some((ask) => ask.id === entry.id));
+        draft.asks.push(...fresh);
+      });
+      if (askOpen && gone.some((ask) => ask.id === askOpen)) {
+        askOpen = undefined;
+        context.ui.dialog.clear();
+      }
+      for (const ask of fresh) {
+        void context.attention.notify({
+          title: "Sandbox",
+          message: `Allow a connection to ${ask.target}?`,
+          notification: { when: "blurred" },
+          sound: { name: "permission", when: "always" },
+        });
+      }
+      showNextAsk();
+    };
+
     const store_ = (sessionID: string | undefined, payload: any) => {
       if (!payload || typeof payload !== "object" || !payload.settings) return;
       update((draft) => {
         draft.states[key(sessionID)] = payload as Payload;
         if (typeof payload.keybind === "string") draft.keybind = payload.keybind;
       });
-      // Questions asked while this window looked elsewhere show up once it shows the project.
-      const waiting = ((payload as Payload).asks ?? []).filter((ask) => !ask.timedOut && !store.asks.some((entry) => entry.id === ask.id));
-      if (waiting.length > 0 && sessionID === currentSession()) {
-        update((draft) => void draft.asks.push(...waiting));
-        showNextAsk();
-      }
+      if (sessionID && sessionID === currentSession()) syncAsks(payload as Payload);
     };
     const refresh = async (sessionID: string | undefined) => {
       try {
@@ -157,8 +190,10 @@ export default Plugin.define({
 
     let askOpen: string | undefined;
     const showNextAsk = () => {
-      const next = store.asks[0];
-      if (!next || askOpen === next.id) return;
+      if (askOpen) return;
+      // Only asks for the session on screen; others wait until you switch to it.
+      const next = store.asks.find((ask) => onScreen(ask.sessionID));
+      if (!next) return;
       askOpen = next.id;
       context.ui.dialog.show(
         () => <AskPopup ask={next} />,
@@ -217,13 +252,7 @@ export default Plugin.define({
           {live().command && <text fg={COLOR.muted as any} wrapMode="word">{`probably from: ${live().command}`}</text>}
           <text fg={COLOR.muted as any}>{live().directory}</text>
           <box height={1} />
-          {live().timedOut ? (
-            <text fg={COLOR.love as any} wrapMode="word">
-              No answer in time: the connection was refused and the agent stopped. Your answer counts from now on.
-            </text>
-          ) : (
-            <text fg={(left() <= 5 ? COLOR.love : COLOR.gold) as any}>{`${left()}s left, then the command fails and the agent stops`}</text>
-          )}
+          <text fg={(left() <= 5 ? COLOR.love : COLOR.gold) as any}>{`${left()}s left, then the connection is refused and the agent stops`}</text>
           <box height={1} />
           <box flexDirection="row" gap={2}>
             <Choice label="(a)llow" choice="allow" color={COLOR.foam} />
@@ -524,55 +553,47 @@ export default Plugin.define({
     // ------------------------------------------------------------------ events
 
     const unsubscribers: (() => void)[] = [];
+    /** RPC events arrive as `{ type, data, … }`; handlers get `data`. */
     const listen = (event: string, handler: (payload: any) => void) => {
       try {
-        unsubscribers.push(rpc().events.on(event, handler));
+        unsubscribers.push(rpc().events.on(event, (envelope: any) => handler(envelope?.data ?? envelope)));
       } catch (error) {
-        console.error(`[sandbox-mode] events.on ${event}`, error);
+        tuiLog("events.on failed", { event, error: String((error as Error)?.message ?? error) });
       }
     };
     listen("changed", () => {
       const ids = new Set([...Object.keys(store.states), key(currentSession())]);
       for (const id of ids) void refresh(id === "home" ? undefined : id);
-      // Pick up timeouts for open popups.
-      void rpc()
-        .state({ directory: directory() })
-        .then((payload: Payload) => {
-          update((draft) => {
-            for (const ask of draft.asks) {
-              const fresh = payload?.asks?.find((entry) => entry.id === ask.id);
-              if (fresh) ask.timedOut = fresh.timedOut;
-            }
-          });
-        })
-        .catch(() => {});
     });
-    /** Only the TUI showing the session (or its subagents) gets the popup; other OpenCode windows on the same server ignore it. */
-    const mine = (target: { sessionID?: string; directory?: string } | undefined) => {
+    /** Whether `sessionID` (a root session) is the one on screen, or the root of the subagent on screen. */
+    const onScreen = (sessionID: string | undefined) => {
       const current = currentSession();
-      if (target?.sessionID && current) return context.data.session.root(current) === target.sessionID;
-      return !!target?.directory && !current && target.directory === directory();
+      return !!sessionID && !!current && (current === sessionID || store.states[key(current)]?.rootID === sessionID);
     };
+    // The server decides which session an ask belongs to; refreshing the session on screen shows it (see syncAsks).
+    // A window that has the session in a tab but shows something else gets a toast that opens it; the popup follows.
     listen("ask", (ask: AskInfo) => {
-      if (!ask?.id || store.asks.some((entry) => entry.id === ask.id) || !mine(ask)) return;
-      update((draft) => void draft.asks.push(ask));
-      void context.attention.notify({
-        title: "Sandbox",
-        message: `Allow a connection to ${ask.target}?`,
-        notification: { when: "blurred" },
-        sound: { name: "permission", when: "always" },
+      void refresh(currentSession());
+      if (!ask?.sessionID || onScreen(ask.sessionID)) return;
+      const inTab = context.ui.tabs.enabled() && context.ui.tabs.list().some((tab) => tab.sessionID === ask.sessionID);
+      if (!inTab && !(ask.directory && ask.directory === directory())) return;
+      context.ui.toast.show({
+        variant: "warning",
+        message: `Sandbox: allow a connection to ${ask.target}?`,
+        sessionID: ask.sessionID,
+        duration: 15_000,
       });
-      showNextAsk();
     });
     listen("failed", (payload: any) => {
+      if (!onScreen(payload?.sessionID)) return void refresh(currentSession());
       const message = `The sandbox can't start (${payload?.reason}). Commands run WITHOUT it in ${payload?.delaySeconds}s; press esc to stop.`;
       context.ui.toast.show({ variant: "error", title: "Sandbox", message, duration: 10_000, sessionID: payload?.sessionID });
       void context.attention.notify({ title: "Sandbox", message, sound: { name: "error" } });
-      void refresh(payload?.sessionID);
+      void refresh(currentSession());
     });
     listen("halted", (payload: any) => {
-      if (!mine(payload)) return;
-      const message = `No answer for ${payload?.target}: the command failed and the agent stopped. Answer the popup, then prompt again.`;
+      if (!onScreen(payload?.sessionID)) return;
+      const message = `No answer for ${payload?.target}: the connection was refused and the agent stopped. Prompt again to retry.`;
       context.ui.toast.show({ variant: "warning", title: "Sandbox", message, duration: 10_000 });
       void context.attention.notify({ title: "Sandbox", message, sound: { name: "error" } });
     });

@@ -6,6 +6,7 @@
  */
 import { Plugin } from "@opencode/plugin";
 import { appendFileSync, mkdirSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { backendFor, type Backend, type Spec } from "./src/backend.ts";
 import { BRIDGE_SOCKET, findForwarder, prepareBridge } from "./src/bridge.ts";
@@ -17,6 +18,8 @@ import { SandboxMode } from "./src/rpc.ts";
 import { loadGlobal, loadProject, saveGlobal, saveProject, type Lists, type ProjectState } from "./src/state.ts";
 
 const LOOKUP_TIMEOUT_MS = 3_000;
+const LOOKUP_ATTEMPTS = 4;
+const LOOKUP_RETRY_MS = 250;
 /** A pending shell call and its create.before are matched within this window. */
 const SHELL_MATCH_MS = 30_000;
 const SWEEP_EVERY_MS = 10 * 60_000;
@@ -33,7 +36,6 @@ interface Ask {
   target: string;
   command?: string;
   deadline: number;
-  timedOut: boolean;
   settled: boolean;
   resolve: (allowed: boolean) => void;
   promise: Promise<boolean>;
@@ -68,7 +70,7 @@ interface Shared {
   /** Session -> its directory and root session. */
   sessions: Map<string, { directory: string; rootID: string }>;
   /** Shell calls in flight: call ID -> root session, project and command. */
-  running: Map<string, { sessionID: string; directory: string; command?: string; at: number; matched: boolean }>;
+  running: Map<string, { sessionID: string; directory?: string; command?: string; at: number; matched: boolean }>;
   checked: Set<string>;
   failed: Set<string>;
   /** Live copies, newest last. The server runs one copy per location and a new one on every hot reload. */
@@ -93,7 +95,9 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const json = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 const logError = (where: string, error?: unknown) => {
   console.error(`[sandbox-mode] ${where}`, error ?? "");
-  log("error", { where, error: String((error as Error)?.message ?? error ?? "") });
+  const detail =
+    error instanceof Error ? error.message || error.name : typeof error === "object" && error ? JSON.stringify(error) : String(error ?? "");
+  log("error", { where, error: detail || "(no message)" });
 };
 /** Network decisions and errors, for troubleshooting: ~/.local/state/opencode-sandbox-mode/sandbox.log. */
 function log(event: string, data: Record<string, unknown>): void {
@@ -150,23 +154,34 @@ export default Plugin.define({
     // ---------------------------------------------------------------- sessions
 
     const fallbackDir = () => ctx.location?.directory ?? process.cwd();
-    /** A session's project directory and root session (subagents share their root's sandbox). */
-    const sessionInfo = async (sessionID: string): Promise<{ directory: string; rootID: string }> => {
+    /**
+     * A session's project directory and root session (subagents share their root's sandbox). A brand-new session can
+     * briefly fail to look up, so this retries; if it still fails, `directory` is the caller's hint or undefined.
+     * Never guess this copy's own location: that may be the home folder, which contains every project.
+     */
+    const sessionInfo = async (sessionID: string, hint?: string): Promise<{ directory?: string; rootID: string }> => {
       const known = shared.sessions.get(sessionID);
       if (known) return known;
-      try {
-        const got = await withTimeout<any>(ctx.session.get({ sessionID } as any), LOOKUP_TIMEOUT_MS);
-        const directory: string = got?.location?.directory ?? fallbackDir();
-        const rootID = got?.parentID ? (await sessionInfo(got.parentID)).rootID : sessionID;
-        const info = { directory, rootID };
-        shared.sessions.set(sessionID, info);
-        return info;
-      } catch (error) {
-        logError(`session lookup ${sessionID}`, error);
-        return { directory: fallbackDir(), rootID: sessionID };
+      let failure: unknown;
+      for (let attempt = 0; attempt < LOOKUP_ATTEMPTS; attempt++) {
+        if (attempt > 0) await sleep(LOOKUP_RETRY_MS * attempt);
+        try {
+          const got = await withTimeout<any>(ctx.session.get({ sessionID } as any), LOOKUP_TIMEOUT_MS);
+          const directory: string | undefined = got?.location?.directory ?? hint;
+          const rootID = got?.parentID ? (await sessionInfo(got.parentID, directory)).rootID : sessionID;
+          if (!directory) return { rootID };
+          const info = { directory, rootID };
+          shared.sessions.set(sessionID, info);
+          return info;
+        } catch (error) {
+          failure = error;
+        }
       }
+      logError(`session lookup ${sessionID} (${LOOKUP_ATTEMPTS} attempts)`, failure);
+      return { directory: hint, rootID: sessionID };
     };
-    const sessionDir = async (sessionID: string | undefined) => (sessionID ? (await sessionInfo(sessionID)).directory : fallbackDir());
+    const sessionDir = async (sessionID: string | undefined, hint?: string) =>
+      (sessionID ? (await sessionInfo(sessionID, hint)).directory : undefined) ?? hint ?? fallbackDir();
 
     const runtime = (sessionID: string, directory: string): Runtime => {
       let entry = shared.runtimes.get(sessionID);
@@ -197,23 +212,23 @@ export default Plugin.define({
 
     /**
      * create.before only knows the cwd and command. The shell call that started it was recorded by execute.before
-     * just before: take the oldest unmatched one in a project around the cwd.
+     * just before: take the oldest unmatched one around the cwd for the session. The project is always the deepest
+     * known project around the cwd, so a wrong or missing session directory can't widen it (e.g. to the home folder).
      */
     const shellOwner = (cwd: string): { sessionID?: string; directory: string } => {
       const now = Date.now();
       const candidates = [...shared.running.values()]
-        .filter((call) => !call.matched && now - call.at < SHELL_MATCH_MS && isInside(cwd, call.directory))
+        .filter((call) => !call.matched && now - call.at < SHELL_MATCH_MS && (!call.directory || isInside(cwd, call.directory)))
         .sort((a, b) => a.at - b.at);
       const call = candidates[0];
-      if (call) {
-        call.matched = true;
-        return { sessionID: call.sessionID, directory: call.directory };
-      }
-      // Not an agent shell call (your own `!` command, a terminal): the deepest known project around the cwd.
-      const dirs = [...new Set([...shared.sessions.values()].map((info) => info.directory))];
-      if (ctx.location?.directory) dirs.push(ctx.location.directory);
-      const directory = dirs.filter((dir) => isInside(cwd, dir)).sort((a, b) => b.length - a.length)[0] ?? cwd;
-      return { directory };
+      if (call) call.matched = true;
+      const dirs = new Set([...shared.projects.keys(), ...[...shared.sessions.values()].map((info) => info.directory)]);
+      if (call?.directory) dirs.add(call.directory);
+      const home = homedir();
+      const directory =
+        [...dirs].filter((dir) => isInside(cwd, dir) && (dir !== home || cwd === home)).sort((a, b) => b.length - a.length)[0] ?? cwd;
+      // Not an agent shell call (your own `!` command, a terminal): no session.
+      return { sessionID: call?.sessionID, directory };
     };
 
     // ---------------------------------------------------------------- network
@@ -232,7 +247,6 @@ export default Plugin.define({
       target: ask.target,
       command: ask.command,
       deadline: ask.deadline,
-      timedOut: ask.timedOut,
     });
 
     /** Whether the root session `sessionID` may connect to `target` (`host:port`). */
@@ -250,7 +264,8 @@ export default Plugin.define({
 
       const key = `${sessionID}\u0000${target}`;
       const existing = shared.asks.get(key);
-      if (existing) return existing.promise;
+      if (existing && !existing.settled) return existing.promise;
+      if (existing) shared.asks.delete(key);
 
       let resolve!: (allowed: boolean) => void;
       const promise = new Promise<boolean>((done) => (resolve = done));
@@ -263,7 +278,6 @@ export default Plugin.define({
         target,
         command: command ?? running?.command,
         deadline: Date.now() + timeout,
-        timedOut: false,
         settled: false,
         resolve: (allowed) => {
           if (ask.settled) return;
@@ -277,9 +291,9 @@ export default Plugin.define({
       emit("ask", askPayload(ask));
       setTimeout(() => {
         if (ask.settled) return;
-        // The command fails and the agent stops; the popup stays so the answer still counts for next time.
-        ask.timedOut = true;
+        // The connection is refused and the agent stops. The ask is dropped, so the next connection asks again.
         ask.resolve(false);
+        if (shared.asks.get(key) === ask) shared.asks.delete(key);
         log("timeout", { id: ask.id, sessionID, target });
         emit("changed", {});
         void latest()
@@ -320,7 +334,7 @@ export default Plugin.define({
     // ---------------------------------------------------------------- RPC
 
     const statePayload = async (input: { sessionID?: string; directory?: string }) => {
-      const info = input.sessionID ? await sessionInfo(input.sessionID) : undefined;
+      const info = input.sessionID ? await sessionInfo(input.sessionID, input.directory) : undefined;
       const directory = info?.directory ?? input.directory ?? fallbackDir();
       const state = project(directory);
       if (!shared.probed) probe();
@@ -343,7 +357,7 @@ export default Plugin.define({
 
     type ListInput = { sessionID?: string; directory?: string; scope?: string; kind?: string; index?: number; pattern?: string };
     const listOf = async (input: ListInput) => {
-      const directory = input.sessionID ? await sessionDir(input.sessionID) : input.directory ?? fallbackDir();
+      const directory = input.sessionID ? await sessionDir(input.sessionID, input.directory) : input.directory ?? fallbackDir();
       const kind = input.kind === "deny" ? "deny" : "allow";
       const isGlobal = input.scope === "global";
       const state = project(directory);
@@ -359,7 +373,8 @@ export default Plugin.define({
       };
       return { list: lists[kind], kind, state, persist };
     };
-    const projectOf = async (input: any) => project(input?.sessionID ? await sessionDir(input.sessionID) : input?.directory ?? fallbackDir());
+    const projectOf = async (input: any) =>
+      project(input?.sessionID ? await sessionDir(input.sessionID, input?.directory) : input?.directory ?? fallbackDir());
 
     const registration = await ctx.rpc.register(SandboxMode, {
       state: async (input: any) => statePayload(input ?? {}),
@@ -484,7 +499,7 @@ export default Plugin.define({
           const command = typeof event.input?.command === "string" ? event.input.command : undefined;
           shared.running.set(String(event.id), { sessionID: rootID, directory, command, at: Date.now(), matched: false });
         }
-        if (shared.checked.has(rootID) || !project(directory).settings.enabled) return;
+        if (!directory || shared.checked.has(rootID) || !project(directory).settings.enabled) return;
         shared.checked.add(rootID);
         // Every new session checks again, so a fixed machine picks the sandbox back up.
         const problem = probe();
@@ -557,6 +572,14 @@ export default Plugin.define({
       if (event.action !== "webfetch" || event.effect === "deny") return;
       try {
         const { directory, rootID } = await sessionInfo(event.sessionID);
+        if (!directory) {
+          // Unknown project: if any project has the sandbox on, let the user decide rather than guess.
+          if ([...shared.projects.values()].some((state) => state.settings.enabled)) {
+            event.effect = "ask";
+            event.message = "sandbox-mode: couldn't tell which project this session belongs to, so you decide";
+          }
+          return;
+        }
         if (!project(directory).settings.enabled) return;
         const raw = [...(event.resources ?? [])].find((resource: string) => /^https?:\/\//i.test(resource));
         if (!raw) return;

@@ -90,10 +90,12 @@ user commits and pushes himself (GPG signing), agents never commit.
    (`askTimeoutSeconds`, default 20):
    - Answer (`answer` RPC): `allow`/`reject` -> `once`; `whitelist`/`blacklist` ->
      `exact(target)` into the **project** list. Resolves the ask.
-   - Timeout: resolve `false` (the command's connection fails), mark
-     `timedOut`, `interrupt` the root session through the newest live copy,
-     emit `halted`. The ask stays in `shared.asks` until answered, so the
-     popup's answer still counts afterwards.
+   - Timeout: resolve `false` (the command's connection fails), **remove the
+     ask** from `shared.asks`, `interrupt` the root session through the newest
+     live copy, emit `changed` and `halted`. The next connection to that host
+     asks again. (Keeping timed-out asks around once left a session refusing a
+     host silently forever: nothing showed the old popup after a restart.)
+     A settled ask still found in `shared.asks` is replaced, never reused.
 
 Callers: the proxy (per runtime, via `latest().decide`), and the `webfetch`
 permission hook (see below).
@@ -210,11 +212,21 @@ different copy, and old copies stay alive until disposed.
   reply and emit goes through `json()`; keep it that way.
 - Mutations return a fresh `state`; the server also emits `changed` and the TUI
   re-fetches every session state it holds.
-- Popups: `ask` events are shown only by the TUI whose current session's root
-  (`context.data.session.root`) is the ask's session (`mine()`); `halted` too.
-  Asks that arrive while the window shows something else are picked up from
-  `state.asks` when it switches to that session. Several OpenCode windows share
-  one server, so events reach all of them.
+- Popups follow the server. Every `ask` event only makes each window refresh
+  the session on screen; `state.asks` (the server's filter: asks of that
+  session's **root**, so a subagent view shows them too) drives `syncAsks`,
+  which queues new asks (with an attention notify) and drops answered or
+  timed-out ones, closing their popup. `showNextAsk` only shows asks whose
+  session is on screen (`onScreen`: same ID or the cached `rootID`); others
+  wait until you switch there. A window that has the ask's session in a tab
+  (or, without tabs, the same project directory) but shows another session
+  gets a toast with `sessionID`, which OpenCode turns into "open that
+  session"; the route change refreshes and the popup follows. Several
+  OpenCode windows share one server, so events reach all of them. `syncAsks`
+  decisions go to `tui.log`.
+- RPC events arrive as `{ type, data, … }` (`@opencode/client` `RpcEventPayload`);
+  `listen()` unwraps `data`. Reading the envelope directly once broke every
+  event-based check silently.
 - `answer` closes the popup first, then calls the RPC with a 5 s timeout and
   toasts any failure or `ok: false`.
 - Debugging RPC by hand: the server listens on a random 127.0.0.1 port (see

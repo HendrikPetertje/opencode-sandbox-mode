@@ -114,8 +114,10 @@ opens a popup:
 | `r` reject | refuse this host for the rest of this session |
 | `b` black-list | add `^host:port$` to the project blocklist |
 
-The popup only shows in the OpenCode window that has the session open (or one
-of its subagents).
+The popup only shows in the OpenCode window that has the session open, also
+while you're looking at one of its subagents. If you're on another session in
+that window, you get a notification instead; clicking it opens the session and
+the popup appears there.
 
 Other connections to the same host wait for the same answer. If you don't
 answer within `askTimeoutSeconds` (20 by default):
@@ -124,8 +126,8 @@ answer within `askTimeoutSeconds` (20 by default):
 2. The agent is stopped.
 3. You get a notification.
 
-The popup stays open, and your answer counts from then on. Answer it, then
-prompt the agent again.
+The popup closes, and the next connection to that host asks again. Prompt the
+agent again to retry.
 
 If a tool gives up on a connection faster than you can answer, add its host to
 a list in advance with `a` in the list modal.
@@ -275,6 +277,8 @@ your file manager on Linux).
   proxy socket and forwarder, removed when the session's sandbox is released
 - `~/.local/state/opencode-sandbox-mode/sandbox.log`: Ask popups, answers,
   timeouts and errors, for troubleshooting
+- `~/.local/state/opencode-sandbox-mode/tui.log`: whether each OpenCode window
+  showed a popup, for troubleshooting
 
 ## License
 
