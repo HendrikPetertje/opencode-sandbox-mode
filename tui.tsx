@@ -1,0 +1,595 @@
+/**
+ * Sandbox mode TUI: a cube in the prompt footer, a settings modal with the
+ * allow/block lists, and the "ask" popup for new network hosts.
+ */
+import { Plugin, usePlugin } from "@opencode/plugin/tui";
+import { RGBA, TextAttributes } from "@opentui/core";
+import { useTerminalDimensions } from "@opentui/solid";
+import { createEffect, createRoot, createSignal, on as track } from "solid-js";
+import type { ProjectSettings, SettingRow } from "./src/options.ts";
+import { isValid } from "./src/patterns.ts";
+import { SandboxMode } from "./src/rpc.ts";
+
+interface Lists {
+  allow: string[];
+  deny: string[];
+}
+
+interface AskInfo {
+  id: string;
+  sessionID?: string;
+  directory: string;
+  target: string;
+  command?: string;
+  deadline: number;
+  timedOut: boolean;
+}
+
+interface Payload {
+  directory: string;
+  enabled: boolean;
+  settings: ProjectSettings;
+  rows: SettingRow[];
+  lists: { project: Lists; global: Lists; config: Lists };
+  keybind: string;
+  failed: boolean;
+  problem: string | null;
+  backend: string | null;
+  askSupported: boolean;
+  asks: AskInfo[];
+}
+
+type ListView = { scope: "project" | "global"; kind: "allow" | "deny" };
+
+const ICON = {
+  cube: "\u{F01A7}",
+  cubeOff: "\u{F141D}",
+  power: "\uF011",
+  globe: "\uF0AC",
+  shield: "\uF132",
+};
+const MODAL_MARGIN = 2;
+/** OpenCode's dialog adds one row of top padding around the plugin's content. */
+const DIALOG_CHROME = 1;
+const MODAL_MIN = 10;
+const DOUBLE_TAP_MS = 600;
+
+// Terminal palette slots, so Ghostty's Rosé Pine (or any theme) supplies the
+// colours: 1 love, 2 pine, 3 gold, 4 foam, 5 iris, 8 muted. The hex values
+// are only used when the terminal palette is unknown.
+function ansi(index: number, fallback: string) {
+  const from = (RGBA as any)?.fromIndex;
+  if (typeof from === "function") {
+    try {
+      return from.call(RGBA, index, fallback);
+    } catch {}
+  }
+  return fallback;
+}
+const COLOR = {
+  love: ansi(1, "#eb6f92"),
+  pine: ansi(2, "#31748f"),
+  gold: ansi(3, "#f6c177"),
+  foam: ansi(4, "#9ccfd8"),
+  iris: ansi(5, "#c4a7e7"),
+  muted: ansi(8, "#6e6a86"),
+  surface: ansi(0, "#26233a"),
+};
+
+const VALUE_COLOR: Record<string, unknown> = {
+  open: COLOR.gold,
+  ask: COLOR.iris,
+  closed: COLOR.foam,
+};
+
+const listKey = (row: SettingRow["key"]): ListView | undefined => {
+  const match = /^list:(project|global):(allow|deny)$/.exec(row);
+  return match ? { scope: match[1] as ListView["scope"], kind: match[2] as ListView["kind"] } : undefined;
+};
+const listTitle = (view: ListView) => `${view.scope === "project" ? "Project" : "Global"} ${view.kind === "allow" ? "allowlist" : "blocklist"}`;
+
+export default Plugin.define({
+  id: "sandbox-mode.tui",
+  async setup(context) {
+    const [store, update] = context.storage.memory("sandbox-mode", {
+      initial: { states: {} as Record<string, Payload>, keybind: "<leader>o", asks: [] as AskInfo[], now: Date.now() },
+    });
+    const rpc = () => context.client.rpc(SandboxMode) as any;
+    const currentSession = () => {
+      const route = context.ui.router.current();
+      return route?.type === "session" ? route.sessionID : undefined;
+    };
+    const key = (sessionID: string | undefined) => sessionID ?? "home";
+    const directory = () => context.location?.directory ?? context.data.location.default()?.directory;
+
+    const store_ = (sessionID: string | undefined, payload: any) => {
+      if (!payload || typeof payload !== "object" || !payload.settings) return;
+      update((draft) => {
+        draft.states[key(sessionID)] = payload as Payload;
+        if (typeof payload.keybind === "string") draft.keybind = payload.keybind;
+      });
+      // Questions asked while this window looked elsewhere show up once it shows the project.
+      const waiting = ((payload as Payload).asks ?? []).filter((ask) => !ask.timedOut && !store.asks.some((entry) => entry.id === ask.id));
+      if (waiting.length > 0 && sessionID === currentSession()) {
+        update((draft) => void draft.asks.push(...waiting));
+        showNextAsk();
+      }
+    };
+    const refresh = async (sessionID: string | undefined) => {
+      try {
+        store_(sessionID, await rpc().state({ sessionID, directory: directory() }));
+      } catch (error) {
+        // The server registers its RPC a moment after the TUI starts; the next `changed` event retries.
+        if ((error as any)?.type !== "rpc.unavailable") console.error("[sandbox-mode] refresh", error);
+      }
+    };
+    const call = async (method: string, sessionID: string | undefined, input: Record<string, unknown>) => {
+      try {
+        store_(sessionID, await rpc()[method]({ sessionID, directory: directory(), ...input }));
+      } catch (error) {
+        console.error(`[sandbox-mode] ${method}`, error);
+      }
+    };
+
+    // ------------------------------------------------------------------ ask popup
+
+    let askOpen: string | undefined;
+    const showNextAsk = () => {
+      const next = store.asks[0];
+      if (!next || askOpen === next.id) return;
+      askOpen = next.id;
+      context.ui.dialog.show(
+        () => <AskPopup ask={next} />,
+        () => {
+          if (askOpen === next.id) askOpen = undefined;
+        },
+      );
+      context.ui.dialog.set({ size: "medium", centered: true });
+    };
+    const answer = async (ask: AskInfo, choice: string) => {
+      // Close first: a slow or failed call must not leave the popup looking unanswered.
+      update((draft) => void (draft.asks = draft.asks.filter((entry) => entry.id !== ask.id)));
+      askOpen = undefined;
+      context.ui.dialog.clear();
+      try {
+        const reply = await Promise.race([
+          rpc().answer({ id: ask.id, choice }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("no reply from the server in 5s")), 5000)),
+        ]);
+        if (!(reply as any)?.ok) {
+          context.ui.toast.show({ variant: "warning", title: "Sandbox", message: `The request for ${ask.target} was already answered or expired.` });
+        }
+      } catch (error) {
+        context.ui.toast.show({ variant: "error", title: "Sandbox", message: `Couldn't send your answer for ${ask.target}: ${(error as Error)?.message ?? error}` });
+      }
+      showNextAsk();
+    };
+
+    const AskPopup = (props: { ask: AskInfo }) => {
+      const ctx = usePlugin();
+      const live = () => store.asks.find((entry) => entry.id === props.ask.id) ?? props.ask;
+      const left = () => Math.max(0, Math.ceil((live().deadline - store.now) / 1000));
+      ctx.keymap.layer(() => ({
+        mode: "global",
+        priority: 20,
+        commands: [
+          { bind: "a", run: () => void answer(props.ask, "allow") },
+          { bind: "w", run: () => void answer(props.ask, "whitelist") },
+          { bind: "r", run: () => void answer(props.ask, "reject") },
+          { bind: "b", run: () => void answer(props.ask, "blacklist") },
+        ],
+      }));
+      const Choice = (p: { label: string; choice: string; color: unknown }) => (
+        <text fg={p.color as any} attributes={TextAttributes.BOLD} onMouseUp={() => void answer(props.ask, p.choice)}>
+          {p.label}
+        </text>
+      );
+      return (
+        <box flexDirection="column" paddingLeft={2} paddingRight={2}>
+          <box flexDirection="row" gap={1}>
+            <text fg={COLOR.iris as any}>{ICON.cube}</text>
+            <text fg={COLOR.iris as any} attributes={TextAttributes.BOLD}>Sandbox: connect to a new host?</text>
+          </box>
+          <box height={1} />
+          <text fg={ctx.theme.text.base as any} attributes={TextAttributes.BOLD}>{live().target}</text>
+          {live().command && <text fg={COLOR.muted as any} wrapMode="word">{`probably from: ${live().command}`}</text>}
+          <text fg={COLOR.muted as any}>{live().directory}</text>
+          <box height={1} />
+          {live().timedOut ? (
+            <text fg={COLOR.love as any} wrapMode="word">
+              No answer in time: the connection was refused and the agent stopped. Your answer counts from now on.
+            </text>
+          ) : (
+            <text fg={(left() <= 5 ? COLOR.love : COLOR.gold) as any}>{`${left()}s left, then the command fails and the agent stops`}</text>
+          )}
+          <box height={1} />
+          <box flexDirection="row" gap={2}>
+            <Choice label="(a)llow" choice="allow" color={COLOR.foam} />
+            <Choice label="(w)hite-list" choice="whitelist" color={COLOR.pine} />
+            <Choice label="(r)eject" choice="reject" color={COLOR.gold} />
+            <Choice label="(b)lack-list" choice="blacklist" color={COLOR.love} />
+          </box>
+          <text fg={COLOR.muted as any} wrapMode="word">
+            allow / reject: for this session · white-list / black-list: saved for this project
+          </text>
+        </box>
+      );
+    };
+
+    // ------------------------------------------------------------------ modal
+
+    const open = (sessionID: string | undefined, view?: ListView, selected = 0) => {
+      void refresh(sessionID);
+      context.ui.dialog.show(() => <Modal sessionID={sessionID} view={view} selected={selected} />);
+      context.ui.dialog.set({ size: "large", centered: true });
+    };
+
+    const Modal = (props: { sessionID: string | undefined; view?: ListView; selected: number }) => {
+      const ctx = usePlugin();
+      const dims = useTerminalDimensions();
+      const height = () => Math.max(MODAL_MIN, Math.min(26, dims().height - 2 * MODAL_MARGIN - DIALOG_CHROME));
+      const state = () => store.states[key(props.sessionID)];
+      const [view, setView] = createSignal<ListView | undefined>(props.view);
+      const [row, setRow] = createSignal(props.view ? 0 : props.selected);
+      const [entry, setEntry] = createSignal(props.view ? props.selected : 0);
+      const [help, setHelp] = createSignal(false);
+      let scroll: { scrollTo(position: number): void } | undefined;
+      let pendingD = 0;
+      let pendingG = 0;
+
+      const entries = () => {
+        const v = view();
+        const s = state();
+        return v && s ? s.lists[v.scope][v.kind] : [];
+      };
+      const configEntries = () => {
+        const v = view();
+        return v?.scope === "global" ? state()?.lists.config[v.kind] ?? [] : [];
+      };
+      const length = () => (view() ? entries().length : state()?.rows.length ?? 0);
+      const move = (delta: number) => {
+        const max = Math.max(0, length() - 1);
+        const next = Math.max(0, Math.min(max, (view() ? entry() : row()) + delta));
+        if (view()) setEntry(next);
+        else setRow(next);
+        scroll?.scrollTo(Math.max(0, next - 5));
+      };
+      const change = (step: -1 | 1) => {
+        const setting = state()?.rows[row()];
+        if (!setting) return;
+        const list = listKey(setting.key);
+        if (list) return step === 1 ? openList(list) : undefined;
+        void call("setSetting", props.sessionID, { key: setting.key, step });
+      };
+      const openList = (list: ListView) => {
+        setView(list);
+        setEntry(0);
+        scroll?.scrollTo(0);
+      };
+      const back = () => {
+        setView(undefined);
+        scroll?.scrollTo(Math.max(0, row() - 5));
+      };
+      const toggle = () => void call("toggle", props.sessionID, {});
+
+      const promptPattern = async (title: string, value: string) => {
+        const list = view()!;
+        const index = entry();
+        const result = await context.ui.dialog.prompt({
+          title,
+          description: "A regex tested against host:port, for example ^registry\\.npmjs\\.org:443$ or \\.example\\.com:443$",
+          placeholder: "^www\\.example\\.com:443$",
+          value,
+        });
+        const pattern = result?.trim();
+        if (pattern && !isValid(pattern)) {
+          context.ui.toast.show({ variant: "error", title: "Sandbox", message: `Not a valid regex: ${pattern}` });
+        }
+        return { list, index, pattern: pattern && isValid(pattern) ? pattern : undefined };
+      };
+      const add = async () => {
+        const { list, pattern } = await promptPattern(`Add to ${listTitle(view()!).toLowerCase()}`, "^");
+        if (pattern) await call("listAdd", props.sessionID, { ...list, pattern });
+        open(props.sessionID, list, pattern ? entries().length : 0);
+      };
+      const edit = async () => {
+        const current = entries()[entry()];
+        if (current === undefined) return;
+        const { list, index, pattern } = await promptPattern("Edit entry", current);
+        if (pattern) await call("listEdit", props.sessionID, { ...list, index, pattern });
+        open(props.sessionID, list, index);
+      };
+      const remove = () => {
+        const list = view();
+        if (!list || entries()[entry()] === undefined) return;
+        void call("listRemove", props.sessionID, { ...list, index: entry() }).then(() => move(0));
+      };
+      const promote = () => {
+        const list = view();
+        if (list?.scope !== "project" || entries()[entry()] === undefined) return false;
+        void call("listPromote", props.sessionID, { kind: list.kind, index: entry() }).then(() => move(0));
+      };
+
+      ctx.keymap.layer(() => ({
+        mode: "global",
+        priority: 10,
+        commands: [
+          { bind: "j", run: () => move(1) },
+          { bind: "k", run: () => move(-1) },
+          { bind: "down", run: () => move(1) },
+          { bind: "up", run: () => move(-1) },
+          {
+            bind: "g",
+            run: () => {
+              const now = Date.now();
+              if (now - pendingG < DOUBLE_TAP_MS) move(-100000);
+              pendingG = now;
+            },
+          },
+          {
+            bind: "?",
+            run: () => {
+              setHelp((on) => !on);
+            },
+          },
+          { bind: "shift+g", run: () => move(100000) },
+          { bind: "h", run: () => (view() ? back() : change(-1)) },
+          { bind: "left", run: () => (view() ? back() : change(-1)) },
+          { bind: "l", run: () => (view() ? false : change(1)) },
+          { bind: "right", run: () => (view() ? false : change(1)) },
+          { bind: "space", run: () => (view() ? false : change(1)) },
+          { bind: "return", run: () => (view() ? void edit() : change(1)) },
+          { bind: "e", run: () => (view() ? void edit() : false) },
+          { bind: "a", run: () => (view() ? void add() : false) },
+          { bind: "p", run: () => (view() ? promote() : false) },
+          {
+            bind: "d",
+            run: () => {
+              if (!view()) return false;
+              const now = Date.now();
+              if (now - pendingD < DOUBLE_TAP_MS) {
+                pendingD = 0;
+                remove();
+              } else pendingD = now;
+            },
+          },
+          { bind: "-", run: toggle },
+          ...Array.from({ length: 9 }, (_, i) => ({
+            bind: String(i + 1),
+            run: () => {
+              if (view() || i >= length()) return false;
+              setRow(i);
+              change(1);
+            },
+          })),
+        ],
+      }));
+
+      const on = () => state()?.enabled ?? false;
+      const valueText = (setting: SettingRow) => {
+        const list = listKey(setting.key);
+        if (list) {
+          const count = state()?.lists[list.scope][list.kind].length ?? 0;
+          const extra = list.scope === "global" ? state()?.lists.config[list.kind].length ?? 0 : 0;
+          return `${count} ${count === 1 ? "entry" : "entries"}${extra ? ` + ${extra} from config` : ""} ›`;
+        }
+        const value = state()?.settings[setting.key as keyof ProjectSettings];
+        if (setting.key === "networkOut" && value === "ask" && state() && !state()!.askSupported) return "ask (acts as closed here)";
+        return typeof value === "boolean" ? (value ? "on" : "off") : String(value);
+      };
+      const valueColor = (setting: SettingRow) => {
+        if (listKey(setting.key)) return COLOR.iris;
+        const value = state()?.settings[setting.key as keyof ProjectSettings];
+        if (typeof value === "boolean") return value ? COLOR.foam : COLOR.muted;
+        return VALUE_COLOR[String(value)] ?? COLOR.gold;
+      };
+
+      const Settings = () => (
+        <scrollbox ref={(el: any) => (scroll = el)} flexGrow={1} flexBasis={0} minHeight={0}>
+          {(state()?.rows ?? []).map((setting, index) => (
+            <box
+              flexDirection="row"
+              flexShrink={0}
+              gap={1}
+              backgroundColor={index === row() ? (COLOR.surface as any) : undefined}
+              onMouseUp={() => {
+                setRow(index);
+                change(1);
+              }}
+            >
+              <text fg={COLOR.muted as any}>{index < 9 ? `${index + 1}` : " "}</text>
+              <text fg={(listKey(setting.key) ? COLOR.iris : ctx.theme.text.base) as any} width={20}>
+                {setting.label}
+              </text>
+              <text fg={(on() ? valueColor(setting) : COLOR.muted) as any} attributes={TextAttributes.BOLD}>
+                {valueText(setting)}
+              </text>
+            </box>
+          ))}
+          <box height={1} flexShrink={0} />
+          <text fg={COLOR.muted as any} wrapMode="word">{state()?.rows[row()]?.description ?? ""}</text>
+          <box height={1} flexShrink={0} />
+          {state()?.problem && on() && <text fg={COLOR.love as any} wrapMode="word">{`Sandbox can't start: ${state()!.problem}`}</text>}
+          <text fg={COLOR.muted as any}>Settings are remembered for this project.</text>
+        </scrollbox>
+      );
+
+      const List = () => (
+        <scrollbox ref={(el: any) => (scroll = el)} flexGrow={1} flexBasis={0} minHeight={0}>
+          {entries().map((pattern, index) => (
+            <box
+              flexDirection="row"
+              flexShrink={0}
+              gap={1}
+              backgroundColor={index === entry() ? (COLOR.surface as any) : undefined}
+              onMouseUp={() => setEntry(index)}
+            >
+              <text fg={(view()!.kind === "allow" ? COLOR.foam : COLOR.love) as any}>{view()!.kind === "allow" ? "✓" : "✗"}</text>
+              <text fg={ctx.theme.text.base as any}>{pattern}</text>
+            </box>
+          ))}
+          {entries().length === 0 && <text fg={COLOR.muted as any}>No entries. Press a to add one.</text>}
+          {configEntries().length > 0 && (
+            <>
+              <box height={1} flexShrink={0} />
+              <text fg={COLOR.muted as any}>From opencode.jsonc (edit them there):</text>
+              {configEntries().map((pattern) => (
+                <text fg={COLOR.muted as any}>{`  ${pattern}`}</text>
+              ))}
+            </>
+          )}
+        </scrollbox>
+      );
+
+      const hint = () => {
+        if (help()) {
+          return view()
+            ? "j/k move · gg/G top/bottom · e/enter edit · a add · dd remove · p promote to global (project lists) · h back · esc close"
+            : "j/k move · gg/G top/bottom · h/l change · space/enter change or open list · 1-9 jump · - power · esc close";
+        }
+        return view() ? "j/k · e edit · a add · dd remove · h back · ? help" : "j/k · h/l change · enter open · - power · ? help";
+      };
+
+      return (
+        <box flexDirection="column" paddingLeft={2} paddingRight={2} height={height()}>
+          <box flexDirection="row" flexShrink={0} gap={1}>
+            <text fg={(state()?.failed ? COLOR.love : on() ? COLOR.foam : COLOR.muted) as any} attributes={TextAttributes.BOLD}>
+              {`${on() ? ICON.cube : ICON.cubeOff} Sandbox${view() ? ` · ${listTitle(view()!)}` : ""}`}
+            </text>
+            <text fg={COLOR.muted as any}>{state()?.directory ?? ""}</text>
+          </box>
+          <box height={1} flexShrink={0} border={["top"]} borderColor={COLOR.muted as any} />
+          {view() ? <List /> : <Settings />}
+          <box height={1} flexShrink={0} border={["top"]} borderColor={COLOR.muted as any} marginTop={1} />
+          <box flexDirection="row" flexShrink={0} justifyContent="space-between">
+            <text fg={COLOR.muted as any} wrapMode="word" flexShrink={1}>{hint()}</text>
+            <text fg={(state()?.failed ? COLOR.love : on() ? COLOR.foam : COLOR.muted) as any} flexShrink={0} onMouseUp={toggle}>
+              {`${ICON.power} ${on() ? "ON" : "OFF"} (-)`}
+            </text>
+          </box>
+        </box>
+      );
+    };
+
+    // ------------------------------------------------------------------ footer
+
+    const FooterIcon = (props: { sessionID?: string }) => {
+      const state = () => store.states[key(props.sessionID)];
+      createEffect(track(() => props.sessionID, (id) => void refresh(id)));
+      const color = () => (!state()?.enabled ? COLOR.muted : state()?.failed ? COLOR.love : COLOR.foam);
+      return (
+        <box flexDirection="row" flexShrink={0} onMouseUp={() => open(props.sessionID)}>
+          <text fg={color() as any}>{state()?.enabled ? ICON.cube : ICON.cubeOff}</text>
+        </box>
+      );
+    };
+
+    const stopFooter = context.ui.slot({
+      append: "prompt.footer.status",
+      render: () => {
+        const route = context.ui.router.current();
+        if (route?.type === "session") return <FooterIcon sessionID={route.sessionID} />;
+        return route?.type === "home" ? <FooterIcon /> : null;
+      },
+    });
+
+    // ------------------------------------------------------------------ events
+
+    const unsubscribers: (() => void)[] = [];
+    const listen = (event: string, handler: (payload: any) => void) => {
+      try {
+        unsubscribers.push(rpc().events.on(event, handler));
+      } catch (error) {
+        console.error(`[sandbox-mode] events.on ${event}`, error);
+      }
+    };
+    listen("changed", () => {
+      const ids = new Set([...Object.keys(store.states), key(currentSession())]);
+      for (const id of ids) void refresh(id === "home" ? undefined : id);
+      // Pick up timeouts for open popups.
+      void rpc()
+        .state({ directory: directory() })
+        .then((payload: Payload) => {
+          update((draft) => {
+            for (const ask of draft.asks) {
+              const fresh = payload?.asks?.find((entry) => entry.id === ask.id);
+              if (fresh) ask.timedOut = fresh.timedOut;
+            }
+          });
+        })
+        .catch(() => {});
+    });
+    /** Only the TUI showing the session (or its subagents) gets the popup; other OpenCode windows on the same server ignore it. */
+    const mine = (target: { sessionID?: string; directory?: string } | undefined) => {
+      const current = currentSession();
+      if (target?.sessionID && current) return context.data.session.root(current) === target.sessionID;
+      return !!target?.directory && !current && target.directory === directory();
+    };
+    listen("ask", (ask: AskInfo) => {
+      if (!ask?.id || store.asks.some((entry) => entry.id === ask.id) || !mine(ask)) return;
+      update((draft) => void draft.asks.push(ask));
+      void context.attention.notify({
+        title: "Sandbox",
+        message: `Allow a connection to ${ask.target}?`,
+        notification: { when: "blurred" },
+        sound: { name: "permission", when: "always" },
+      });
+      showNextAsk();
+    });
+    listen("failed", (payload: any) => {
+      const message = `The sandbox can't start (${payload?.reason}). Commands run WITHOUT it in ${payload?.delaySeconds}s; press esc to stop.`;
+      context.ui.toast.show({ variant: "error", title: "Sandbox", message, duration: 10_000, sessionID: payload?.sessionID });
+      void context.attention.notify({ title: "Sandbox", message, sound: { name: "error" } });
+      void refresh(payload?.sessionID);
+    });
+    listen("halted", (payload: any) => {
+      if (!mine(payload)) return;
+      const message = `No answer for ${payload?.target}: the command failed and the agent stopped. Answer the popup, then prompt again.`;
+      context.ui.toast.show({ variant: "warning", title: "Sandbox", message, duration: 10_000 });
+      void context.attention.notify({ title: "Sandbox", message, sound: { name: "error" } });
+    });
+
+    const ticker = setInterval(() => {
+      if (store.asks.length > 0) update((draft) => void (draft.now = Date.now()));
+    }, 500);
+
+    void refresh(currentSession());
+
+    // Closing a session tab releases its sandbox runtime (proxy, one-off answers). Without tabs, the server's idle sweep does it.
+    let openTabs = new Set<string>();
+    const stopTabs = createRoot((dispose) => {
+      createEffect(() => {
+        if (!context.ui.tabs.enabled()) return;
+        const now = new Set(context.ui.tabs.list().map((tab) => tab.sessionID));
+        for (const sessionID of openTabs) {
+          if (!now.has(sessionID)) void rpc().release({ sessionID }).catch(() => {});
+        }
+        openTabs = now;
+      });
+      return dispose;
+    });
+
+    context.keymap.layer(() => ({
+      mode: "global",
+      commands: [
+        {
+          id: "sandbox-mode.open",
+          title: "Sandbox settings",
+          group: "Sandbox",
+          bind: store.keybind,
+          palette: true,
+          slash: { name: "sandbox" },
+          run: () => open(currentSession()),
+        },
+      ],
+      bindings: ["sandbox-mode.open"],
+    }));
+
+    return () => {
+      clearInterval(ticker);
+      stopTabs();
+      for (const stop of unsubscribers) stop?.();
+      stopFooter?.();
+    };
+  },
+});
