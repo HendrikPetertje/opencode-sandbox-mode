@@ -13,7 +13,8 @@ package (`package.json` `exports`: `.` -> `index.ts`, `./tui` -> `tui.tsx`):
 
 - **Server half** (`index.ts`): wraps shell commands (`shell.hook("create.before")`),
   runs one network proxy per session for "ask" mode, checks `webfetch` hosts,
-  stores settings, serves the RPC.
+  keeps OpenCode's config read-only (the config lock), optionally wraps local MCP
+  servers (`sandboxMcp`), stores settings, serves the RPC.
 - **TUI half** (`tui.tsx`): footer cube icon, settings modal with list editors,
   the "ask" popup, notifications. It has **no access to server options or
   state** and talks to the server only through the RPC in `src/rpc.ts`.
@@ -31,14 +32,15 @@ user commits and pushes himself (GPG signing), agents never commit.
 |---|---|---|
 | `index.ts` | Server plugin: shared state, sessions and runtimes, the `decide` network pipeline, proxies, RPC handlers, hooks, idle sweep, `sandbox.log`. | everything in `src/` |
 | `tui.tsx` | TUI plugin: `FooterIcon`, `Modal` (settings and list views), `AskPopup`, event listeners, tab-close tracking, keymaps, colours. | `src/rpc.ts`, `src/options.ts` (types), `src/patterns.ts` (`isValid`), `src/paths.ts` (`stateDir`) |
-| `src/options.ts` | `parseOptions` (plugin options -> `Options`; `defaults` are the settings for projects not seen yet), `ProjectSettings`, `SETTING_ROWS` (modal rows incl. list rows `list:<scope>:<kind>` and the action row `openState`), `adjust` (h/l/space), `linkNetwork` (Linux: in follows out), `DEFAULT_CREDENTIALS`. | - |
-| `src/state.ts` | Sync JSON files: `projects/<hash>.json` (`{ directory, settings, lists }`) and `global.json` (`{ allow, deny }`). Atomic writes (tmp + rename). | `paths.ts` |
+| `src/options.ts` | `parseOptions` (plugin options -> `Options`; `defaults` are the settings for projects not seen yet), `ProjectSettings`, `SETTING_ROWS` (modal rows incl. list rows `list:<scope>:<kind>` and the action row `openState`), `adjust` (h/l/space), `linkNetwork` (Linux: in follows out), `DEFAULT_CREDENTIALS`, `resolveOptions` (reads the jsonc file named by the `extends` option; its keys win over the inline ones; `stripJsonc`), `lockConfig` (a setting that is never stored), `homeLinks`, `sandboxMcp` entries (`{ name, args }`). | `paths.ts` |
+| `src/state.ts` | `homeDir`, `hasProjectFiles` and `removeProjectFiles` (home + `projects/<hash>.json` for one project; symlinks are removed, not followed). Sync JSON files: `projects/<hash>.json` (`{ directory, settings, lists }`) and `global.json` (`{ allow, deny }`). Atomic writes (tmp + rename). | `paths.ts` |
 | `src/patterns.ts` | Allow/block entries are **regexes on `host:port`**, case-insensitive, compiled once (`compile` cache). `judge`: block wins, then allow, else `ask`. `exact(target)` = escaped `^host:port$` (what the popup saves). | - |
 | `src/proxy.ts` | Forward proxy on `127.0.0.1:<random>` (plus an optional unix socket): HTTP `CONNECT`, plain HTTP with absolute URLs (rewritten to origin form, `Connection: close`), SOCKS5 CONNECT. Calls `decide(target)` per connection before connecting. | - |
 | `src/backend.ts` | `Backend` per OS: `probe()` (does the sandbox start?), `wrap(spec)` (the command string), `supportsAsk`, `linkedNetwork`. `seatbeltProfile` builds the SBPL profile; `bwrapArgs` the bwrap flags. | `bridge.ts`, `paths.ts` |
 | `src/bridge.ts` | Linux ask mode: forwarder source (python3, else node), `findForwarder`, `prepareBridge`, `bridgePrelude` (shell snippet that starts the forwarder, waits for a ready file, then `exec "$0" -c "$1"`). | - |
-| `src/paths.ts` | `stateDir()` (respects `XDG_STATE_HOME`), `projectHash`, `expandHome`, `real` (resolves symlinks of the nearest existing parent; Seatbelt needs `/private/var`, not `/var`), `isInside`. | - |
+| `src/paths.ts` | `stateDir()` (respects `XDG_STATE_HOME`), `projectHash`, `expandHome`, `real` (resolves symlinks of the nearest existing parent; Seatbelt needs `/private/var`, not `/var`), `isInside`, `configDir`, `lockedPaths` (what the config lock protects), `linkIntoHome` (symlinks `homeLinks` into the sandbox home). | - |
 | `src/rpc.ts` | `Rpc.define`: methods `state`, `toggle`, `setSetting`, `listAdd`, `listEdit`, `listRemove`, `listPromote`, `answer`, `release`; events `changed`, `ask`, `failed`, `halted`. Loose `{type:"object"}` schemas. | `@opencode/plugin/rpc` |
+| `src/mcp.ts` | Wraps local MCP servers: `matchesName` (`*` globs), `sandboxServer` (backend `wrapArgv` around the server's argv, HOME and cwd = `state/mcp/<name>`, proxy env incl. `NODE_USE_ENV_PROXY=1`, `args` appended), `proxyEnv` (also used for shell commands). Network is `ask` through the project's proxy, or `closed` without a proxy port. | `backend.ts`, `paths.ts` |
 | `src/sandbox.test.ts` | `bun test`: patterns, options, profiles, proxy (CONNECT, SOCKS5), a live Seatbelt run on macOS. | pure modules |
 
 ## Concepts
@@ -106,10 +108,9 @@ permission hook (see below).
 sandbox. `permission.hook("evaluate")` for `action === "webfetch"` parses the
 URL from `resources`, runs `decide(root, host:port, "webfetch <url>")`, and on
 a refusal sets `effect = "deny"` with a message starting `sandbox-mode`
-(auto-mode leaves those denies alone). MCP servers and `websearch` are not
-covered (an MCP routing feature was discussed and deliberately postponed:
-local MCPs could be wrapped via `ctx.mcp.transform`, remote ones only checked
-per call, podman MCPs can't be contained).
+(auto-mode leaves those denies alone). `websearch` is not covered. MCP servers
+only through `sandboxMcp` (see MCP in the Backends section); remote ones can't
+be wrapped and podman-based ones can't be contained.
 
 ### When the sandbox can't start
 
@@ -147,6 +148,15 @@ order matters:
   re-allow the sandbox HOME, which sits inside the state folder. Never stored:
   `lockConfig` is forced on at load and by `toggle`, and left out by `saveProject`.
   File tools are denied in a `permission` `evaluate` hook (`FILE_WRITE_ACTIONS`).
+- MCP: `sandboxMcp` names go through `ctx.mcp.transform` (`src/mcp.ts`): `wrapArgv` puts the backend
+  around the server's argv, HOME and cwd are `state/mcp/<name>`. OpenCode runs MCP servers per location and the plugin
+  has one copy per location, so each copy's transform wraps iff the sandbox is on for **its own** project
+  (`project(fallbackDir())`); `toggle` calls `reloadMcp`, which reloads every live copy, so servers get the wrapped or
+  original command. Fails closed: if the sandbox can't start, the server gets `disabled: true`. Remote servers and
+  servers without a command are skipped.
+  Network: one proxy per project (`shared.mcpProxies`, started in `setup`, stable port), `decideMcp(directory, target)`
+  picks the owner session from `shared.calls` (tool calls in flight), else the project's latest runtime/session
+  (`quiet`: no interrupt on timeout), then goes through `decide` like a shell command.
 - Credentials: deny read and write on `credentialPaths`.
 - Network out not open: deny outbound, allow unix sockets (DNS via
   mDNSResponder), `localhost:*` when the Localhost setting is on, and
@@ -182,7 +192,8 @@ order matters:
 | Sandbox HOME | project | `…/homes/<hash>/` |
 | Linux bridge (socket + forwarder) | runtime | `…/run/<hash(sessionID)>/`, removed on release |
 | Log (ask, answer, timeout, runtime start/release, errors) | disk | `…/sandbox.log` (append only, not trimmed yet) |
-| Runtimes, asks, session map, running calls, failed/checked sessions, live copies | process memory | `globalThis.__opencodeSandboxMode` |
+| Runtimes, asks, session map, running shell calls, tool calls in flight (`calls`), MCP proxies (`mcpProxies`, per project, stable port), failed/checked sessions, live copies | process memory | `globalThis.__opencodeSandboxMode` |
+| Per-MCP-server `HOME` | server | `…/mcp/<name>/` |
 
 Never write inside the config dir or a project at runtime: OpenCode watches
 them and reloads plugins in a loop. Everything goes under `stateDir()`.
@@ -198,11 +209,16 @@ different copy, and old copies stay alive until disposed.
   field by field with `??=` so an older shared object gains new fields.
 - **Long-lived things never use their creator's closures.** Proxies and ask
   timers call `latest()` = the newest entry in `shared.copies` (`{ emit,
-  interrupt, decide }`), registered at setup and removed on dispose. A stale
+  interrupt, decide, decideMcp, reloadMcp }`), registered at setup and removed on dispose. A stale
   closure once made "allow" in the popup do nothing.
 - Read options through `shared.options ?? options` in long-lived paths.
 - Restart OpenCode after larger changes; a running server keeps old shared
   objects (and old `asks`) across reloads.
+- Every setup resets `lockConfig` to on for the projects already cached on `shared` (a hot reload keeps them), so the
+  lock is back on after any plugin reload, also when the user just turned it off. A stale cached state once had no
+  `lockConfig` at all (read as off).
+- A copy only reloads the MCP servers of its own location: reloading after a toggle has to go through every entry in
+  `shared.copies` (`reloadMcp`).
 
 ## TUI <-> server
 
@@ -298,7 +314,12 @@ Its podman VM clock is skewed: apt needs
 
 ## Known gaps and ideas
 
-- MCP servers and `websearch` aren't covered (see webfetch above).
+- `websearch`, remote MCP servers and container-based (podman) MCP servers aren't covered.
+- MCP network on Linux: no bridge for the per-project proxy yet, so wrapped servers get no network. Per-server
+  allow lists (the popup doesn't name the server; the proxy can't tell them apart) are a possible next step via
+  proxy credentials.
+- MCP attribution to a session is a heuristic (`mcpOwner`: latest tool call in flight, else the project's latest
+  runtime); two sessions calling servers at the same moment can swap.
 - The user's `!` commands get no proxy in ask mode (no session to ask).
 - `shellOwner` matches by time and cwd; two sessions in the same project
   starting shell calls at the same moment could swap runtimes (same project

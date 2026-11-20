@@ -10,12 +10,13 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { backendFor, type Backend, type Spec } from "./src/backend.ts";
 import { BRIDGE_SOCKET, findForwarder, prepareBridge } from "./src/bridge.ts";
+import { matchesName, proxyEnv, sandboxServer } from "./src/mcp.ts";
 import { adjust, linkNetwork, resolveOptions, SETTING_ROWS, type Options, type SettingKey } from "./src/options.ts";
 import { expandHome, isInside, linkIntoHome, lockedPaths, projectHash, real, stateDir } from "./src/paths.ts";
 import { exact, isValid, judge } from "./src/patterns.ts";
 import { startProxy, type Proxy } from "./src/proxy.ts";
 import { SandboxMode } from "./src/rpc.ts";
-import { loadGlobal, loadProject, saveGlobal, saveProject, type Lists, type ProjectState } from "./src/state.ts";
+import { hasProjectFiles, homeDir, loadGlobal, loadProject, removeProjectFiles, saveGlobal, saveProject, type Lists, type ProjectState } from "./src/state.ts";
 
 const LOOKUP_TIMEOUT_MS = 3_000;
 const LOOKUP_ATTEMPTS = 4;
@@ -38,6 +39,8 @@ interface Ask {
   target: string;
   command?: string;
   deadline: number;
+  /** Nothing of the agent is known to be behind this connection: a timeout refuses it but doesn't stop the agent. */
+  quiet?: boolean;
   settled: boolean;
   resolve: (allowed: boolean) => void;
   promise: Promise<boolean>;
@@ -56,7 +59,11 @@ interface Runtime {
 interface Copy {
   emit: (event: string, payload: Record<string, unknown>) => void;
   interrupt: (sessionID: string) => Promise<unknown>;
-  decide: (sessionID: string, target: string, command?: string) => Promise<boolean>;
+  decide: (sessionID: string, target: string, command?: string, quiet?: boolean) => Promise<boolean>;
+  /** Network decision for the MCP servers of one project: like a shell command of the session that is calling them. */
+  decideMcp: (directory: string, target: string) => Promise<boolean>;
+  /** Restarts this copy's MCP servers (each location has its own set). */
+  reloadMcp: () => Promise<unknown>;
 }
 
 interface Shared {
@@ -73,6 +80,10 @@ interface Shared {
   sessions: Map<string, { directory: string; rootID: string }>;
   /** Shell calls in flight: call ID -> root session, project and command. */
   running: Map<string, { sessionID: string; directory?: string; command?: string; at: number; matched: boolean }>;
+  /** One proxy per project for its sandboxed MCP servers; it keeps its port across plugin reloads. */
+  mcpProxies: Map<string, Promise<Proxy>>;
+  /** Tool calls in flight (not shell): call ID -> root session and project. MCP traffic is attributed to these. */
+  calls: Map<string, { sessionID: string; directory: string; at: number }>;
   checked: Set<string>;
   failed: Set<string>;
   /** Live copies, newest last. The server runs one copy per location and a new one on every hot reload. */
@@ -121,6 +132,8 @@ export default Plugin.define({
     shared.asks ??= new Map();
     shared.sessions ??= new Map();
     shared.running ??= new Map();
+    shared.calls ??= new Map();
+    shared.mcpProxies ??= new Map();
     shared.checked ??= new Set();
     shared.failed ??= new Set();
     shared.copies ??= [];
@@ -256,10 +269,11 @@ export default Plugin.define({
       target: ask.target,
       command: ask.command,
       deadline: ask.deadline,
+      quiet: ask.quiet ?? false,
     });
 
     /** Whether the root session `sessionID` may connect to `target` (`host:port`). */
-    const decide = async (sessionID: string, target: string, command?: string): Promise<boolean> => {
+    const decide = async (sessionID: string, target: string, command?: string, quiet = false): Promise<boolean> => {
       const entry = shared.runtimes.get(sessionID);
       const directory = entry?.directory ?? (await sessionDir(sessionID));
       const { settings } = project(directory);
@@ -287,6 +301,7 @@ export default Plugin.define({
         target,
         command: command ?? running?.command,
         deadline: Date.now() + timeout,
+        quiet,
         settled: false,
         resolve: (allowed) => {
           if (ask.settled) return;
@@ -303,8 +318,10 @@ export default Plugin.define({
         // The connection is refused and the agent stops. The ask is dropped, so the next connection asks again.
         ask.resolve(false);
         if (shared.asks.get(key) === ask) shared.asks.delete(key);
-        log("timeout", { id: ask.id, sessionID, target });
+        log("timeout", { id: ask.id, sessionID, target, quiet });
         emit("changed", {});
+        // No call of the agent is known to be behind this connection: refuse it but leave the agent running.
+        if (quiet) return;
         void latest()
           ?.interrupt(sessionID)
           .catch((error) => logError(`interrupt ${sessionID}`, error));
@@ -353,6 +370,7 @@ export default Plugin.define({
         enabled: state.settings.enabled,
         settings: state.settings,
         rows: SETTING_ROWS,
+        files: { home: homeDir(directory), exists: hasProjectFiles(directory) },
         lists: { project: state.lists, global: globalLists(), config: { allow: options.allow, deny: options.deny } },
         keybind: options.keybind,
         failed: info ? shared.failed.has(info.rootID) : false,
@@ -393,6 +411,7 @@ export default Plugin.define({
         state.settings = { ...state.settings, enabled: !state.settings.enabled, lockConfig: true };
         save(state);
         emit("changed", {});
+        await reloadMcp();
         return statePayload(input ?? {});
       },
       setSetting: async (input: any) => {
@@ -471,6 +490,24 @@ export default Plugin.define({
         }
         return { ok: !!ask };
       },
+      removeFiles: async (input: any) => {
+        const state = await projectOf(input);
+        if (state.settings.enabled) {
+          return { ...(await statePayload(input ?? {})), removed: false, reason: "The sandbox is on for this project. Turn it off first." };
+        }
+        try {
+          removeProjectFiles(state.directory);
+        } catch (error) {
+          logError("removing the project's sandbox files", error);
+          return { ...(await statePayload(input ?? {})), removed: false, reason: `Couldn't remove them: ${(error as Error)?.message ?? error}` };
+        }
+        // Forget the cached state too, or the next change would write the old settings and lists back.
+        shared.projects.delete(state.directory);
+        for (const entry of [...shared.runtimes.values()]) if (entry.directory === state.directory) await release(entry.sessionID, "files removed");
+        log("project.files.removed", { directory: state.directory });
+        emit("changed", {});
+        return { ...(await statePayload(input ?? {})), removed: true };
+      },
       release: async (input: any) => {
         if (typeof input?.sessionID === "string") {
           const { rootID } = await sessionInfo(input.sessionID);
@@ -480,11 +517,41 @@ export default Plugin.define({
       },
     } as any);
 
+    /**
+     * MCP servers are shared by every session of a project, so a connection is attributed to the session whose tool call
+     * is in flight (the latest one). With no call in flight (a server starting up) it is the project's session used last;
+     * that one is only asked, the agent isn't stopped when you don't answer. With no session at all, only the lists decide.
+     */
+    const mcpOwner = (directory: string): { sessionID: string; quiet: boolean } | undefined => {
+      const inside = (dir: string | undefined) => !!dir && (isInside(dir, directory) || isInside(directory, dir));
+      const call = [...shared.calls.values()].filter((entry) => inside(entry.directory)).sort((a, b) => b.at - a.at)[0];
+      if (call) return { sessionID: call.sessionID, quiet: false };
+      const used = [...shared.runtimes.values()].filter((entry) => inside(entry.directory)).sort((a, b) => b.lastUsed - a.lastUsed)[0];
+      if (used) return { sessionID: used.sessionID, quiet: true };
+      const known = [...shared.sessions.values()].reverse().find((info) => inside(info.directory));
+      return known ? { sessionID: known.rootID, quiet: true } : undefined;
+    };
+
+    const decideMcp = async (directory: string, target: string): Promise<boolean> => {
+      const owner = mcpOwner(directory);
+      if (!owner) {
+        const state = project(directory);
+        const allowed = state.settings.networkOut === "open" || judge(target, allLists(directory)) === "allow";
+        log("mcp.network", { target, directory, allowed, reason: "no session to ask" });
+        return allowed;
+      }
+      const allowed = await decide(owner.sessionID, target, "MCP server", owner.quiet);
+      log("mcp.network", { target, directory, allowed, sessionID: owner.sessionID, quiet: owner.quiet });
+      return allowed;
+    };
+
     const copy: Copy = {
       emit: (event, payload) =>
         void registration.events.emit(event as any, json(payload) as any).catch((error: unknown) => logError(`emit ${event}`, error)),
       interrupt: (sessionID) => ctx.session.interrupt({ sessionID } as any),
       decide,
+      decideMcp,
+      reloadMcp: () => ctx.mcp.reload(),
     };
     shared.copies.push(copy);
 
@@ -497,6 +564,7 @@ export default Plugin.define({
         if (!busy.has(entry.sessionID) && now - entry.lastUsed > IDLE_RELEASE_MS) void release(entry.sessionID, "idle");
       }
       for (const [id, call] of shared.running) if (now - call.at > IDLE_RELEASE_MS) shared.running.delete(id);
+      for (const [id, call] of shared.calls) if (now - call.at > IDLE_RELEASE_MS) shared.calls.delete(id);
     }, SWEEP_EVERY_MS);
     (shared.sweeper as any).unref?.();
 
@@ -508,6 +576,9 @@ export default Plugin.define({
         if (event.tool === "shell") {
           const command = typeof event.input?.command === "string" ? event.input.command : undefined;
           shared.running.set(String(event.id), { sessionID: rootID, directory, command, at: Date.now(), matched: false });
+        }
+        if (event.tool !== "shell" && directory) {
+          shared.calls.set(String(event.id), { sessionID: rootID, directory, at: Date.now() });
         }
         if (!directory || shared.checked.has(rootID) || !project(directory).settings.enabled) return;
         shared.checked.add(rootID);
@@ -526,6 +597,7 @@ export default Plugin.define({
 
     const after = await ctx.tool.hook("execute.after", async (event: any) => {
       shared.running.delete(String(event.id));
+      shared.calls.delete(String(event.id));
     });
 
     const shellHook = await ctx.shell.hook("create.before", async (event) => {
@@ -537,7 +609,7 @@ export default Plugin.define({
         if (shared.problem || !shared.backend) return;
         const { settings } = state;
         const config = shared.options ?? options;
-        const home = settings.syntheticHome ? join(stateDir(), "homes", projectHash(owner.directory)) : undefined;
+        const home = settings.syntheticHome ? homeDir(owner.directory) : undefined;
         if (home) {
           mkdirSync(home, { recursive: true });
           linkIntoHome(home, config.homeLinks, config.credentialPaths.map(expandHome));
@@ -561,12 +633,7 @@ export default Plugin.define({
           // Linux: the sandbox's own 127.0.0.1:<port> is served by the forwarder, which talks to the proxy's socket.
           const forwarder = shared.backend.linkedNetwork ? findForwarder() : undefined;
           if (forwarder) spec.bridge = { dir: bridgeDir(entry), port: proxy.port, forwarder };
-          const url = `http://127.0.0.1:${proxy.port}`;
-          for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "npm_config_proxy", "npm_config_https_proxy"]) {
-            event.env[name] = url;
-          }
-          event.env.ALL_PROXY = event.env.all_proxy = `socks5h://127.0.0.1:${proxy.port}`;
-          event.env.NO_PROXY = event.env.no_proxy = settings.localhost ? "localhost,127.0.0.1,::1" : "";
+          Object.assign(event.env, proxyEnv(proxy.port, settings.localhost));
         }
         event.env.OPENCODE_SANDBOX = shared.backend.name;
         event.command = shared.backend.wrap(spec);
@@ -596,6 +663,75 @@ export default Plugin.define({
         log("lock.deny", { sessionID: event.sessionID, action: event.action, path: hit });
       } catch (error) {
         logError("config lock check", error);
+      }
+    });
+
+    // Every location (project) has its own MCP servers and its own copy of this plugin: the servers follow the sandbox
+    // of that project. With it off they start as configured.
+    const mcpSandboxOn = () => project(fallbackDir()).settings.enabled;
+    // Servers restart with the new command, or the original one, when the sandbox is turned on or off. Every location
+    // has its own copy of the plugin and its own servers, so all live copies reload.
+    const reloadMcp = async () => {
+      if ((shared.options ?? options).sandboxMcp.length === 0) return;
+      await Promise.allSettled(
+        shared.copies.map((entry) => entry.reloadMcp().catch((error: unknown) => logError("reloading MCP servers", error))),
+      );
+    };
+
+    // One proxy per project for its sandboxed MCP servers. Where there's no bridge for it (Linux), they get no network.
+    let mcpPort: number | undefined;
+    if (options.sandboxMcp.length > 0 && !shared.backend?.linkedNetwork) {
+      const dir = fallbackDir();
+      let proxy = shared.mcpProxies.get(dir);
+      if (!proxy) {
+        proxy = startProxy(async (target) => (await latest()?.decideMcp(dir, target)) ?? false);
+        shared.mcpProxies.set(dir, proxy);
+        proxy.catch((error) => {
+          logError("starting the MCP proxy", error);
+          shared.mcpProxies.delete(dir);
+        });
+      }
+      mcpPort = await proxy.then((started) => started.port).catch(() => undefined);
+    }
+
+    // Local MCP servers listed in `sandboxMcp` only start inside the sandbox while it is on. If it can't start, they
+    // don't start at all.
+    const mcp = await ctx.mcp.transform((editor) => {
+      const config = shared.options ?? options;
+      const names = config.sandboxMcp.map((entry) => entry.name);
+      const active = names.length > 0 && mcpSandboxOn();
+      log("mcp.transform", {
+        active,
+        patterns: names,
+        servers: editor.list().map(([name]) => name),
+        projects: [...shared.projects.values()].map((state) => ({ directory: state.directory, enabled: state.settings.enabled })),
+        location: fallbackDir(),
+      });
+      if (!active) return;
+      for (const [name] of editor.list()) {
+        const entry = config.sandboxMcp.find((candidate) => matchesName(name, [candidate.name]));
+        if (!entry) continue;
+        try {
+          if (!shared.probed) probe();
+          const backend = shared.backend;
+          const current = editor.get(name) as any;
+          if (shared.problem || !backend) {
+            logError(`mcp ${name} not started: ${shared.problem ?? "no sandbox backend"}`);
+            editor.update(name, (server: any) => void (server.disabled = true));
+            continue;
+          }
+          const result = sandboxServer(name, current, { backend, args: entry.args, proxyPort: mcpPort, credentialPaths: config.credentialPaths.map(expandHome), homeLinks: config.homeLinks });
+          if (!result.ok) {
+            log("mcp.skip", { name, reason: result.reason });
+            continue;
+          }
+          editor.update(name, (server: any) => void Object.assign(server, result.server));
+          log("mcp.sandboxed", { name, command: result.server.command?.slice(0, 2) });
+        } catch (error) {
+          // Fail closed: a server we meant to sandbox but couldn't doesn't start.
+          logError(`mcp ${name}`, error);
+          editor.update(name, (server: any) => void (server.disabled = true));
+        }
       }
     });
 
@@ -629,7 +765,7 @@ export default Plugin.define({
 
     return async () => {
       shared.copies = shared.copies.filter((entry) => entry !== copy);
-      await Promise.allSettled([before.dispose(), after.dispose(), shellHook.dispose(), permission.dispose(), webfetchPermission.dispose(), registration.dispose()]);
+      await Promise.allSettled([before.dispose(), after.dispose(), shellHook.dispose(), permission.dispose(), webfetchPermission.dispose(), mcp.dispose(), registration.dispose()]);
     };
   },
 });

@@ -31,6 +31,8 @@ export interface Backend {
   /** Undefined when it works, otherwise why not. */
   probe(): string | undefined;
   wrap(spec: Spec): string;
+  /** The same sandbox around a program and its arguments (for MCP servers), without a shell in between. */
+  wrapArgv(spec: Spec, argv: string[]): string[];
 }
 
 export const quote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
@@ -94,6 +96,9 @@ export const seatbelt: Backend = {
   wrap(spec) {
     return `${SANDBOX_EXEC} -p ${quote(seatbeltProfile(spec))} ${quote(spec.shell)} -c ${quote(spec.command)}`;
   },
+  wrapArgv(spec, argv) {
+    return [SANDBOX_EXEC, "-p", seatbeltProfile(spec), ...argv];
+  },
 };
 
 const isDir = (path: string) => {
@@ -153,6 +158,9 @@ export const bwrap: Backend = {
     if (!spec.bridge) return `bwrap ${args} ${quote(spec.shell)} -c ${quote(spec.command)}`;
     const prelude = bridgePrelude(spec.bridge.forwarder, spec.bridge.port);
     return `bwrap ${args} /bin/sh -c ${quote(prelude)} ${quote(spec.shell)} ${quote(spec.command)}`;
+  },
+  wrapArgv(spec, argv) {
+    return ["bwrap", ...bwrapArgs(spec), ...argv];
   },
 };
 

@@ -29,6 +29,8 @@ export interface Options {
   credentialPaths: string[];
   /** Paths in your real home that are symlinked into the sandbox home (same relative path), e.g. `~/.config/containers`. */
   homeLinks: string[];
+  /** Local MCP servers (`*` matches anything in the name) that only start inside the sandbox, with extra arguments for the sandboxed command. */
+  sandboxMcp: { name: string; args: string[] }[];
   allow: string[];
   deny: string[];
 }
@@ -101,6 +103,16 @@ export function resolveOptions(raw: Record<string, unknown> | undefined): { opti
   }
 }
 
+/** `"name"` or `{ "name": "...", "args": ["..."] }`. */
+const mcpEntries = (value: unknown): { name: string; args: string[] }[] =>
+  (Array.isArray(value) ? value : []).flatMap((item) => {
+    if (typeof item === "string" && item.trim()) return [{ name: item.trim(), args: [] }];
+    if (item && typeof item === "object" && typeof (item as any).name === "string" && (item as any).name.trim()) {
+      return [{ name: (item as any).name.trim(), args: strings((item as any).args) ?? [] }];
+    }
+    return [];
+  });
+
 export function parseOptions(raw: Record<string, unknown> | undefined): Options {
   const options = raw ?? {};
   return {
@@ -120,6 +132,7 @@ export function parseOptions(raw: Record<string, unknown> | undefined): Options 
     failDelaySeconds: seconds(options.failDelaySeconds, 4),
     credentialPaths: strings(options.credentialPaths) ?? DEFAULT_CREDENTIALS,
     homeLinks: strings(options.homeLinks) ?? [],
+    sandboxMcp: mcpEntries(options.sandboxMcp),
     allow: strings(options.allow) ?? [],
     deny: strings(options.deny) ?? [],
   };
@@ -128,7 +141,7 @@ export function parseOptions(raw: Record<string, unknown> | undefined): Options 
 export type SettingKey = Exclude<keyof ProjectSettings, "enabled">;
 
 export interface SettingRow {
-  key: SettingKey | "list:project:allow" | "list:project:deny" | "list:global:allow" | "list:global:deny" | "openState";
+  key: SettingKey | "list:project:allow" | "list:project:deny" | "list:global:allow" | "list:global:deny" | "openState" | "removeFiles";
   label: string;
   description: string;
 }
@@ -152,6 +165,12 @@ export const SETTING_ROWS: SettingRow[] = [
   { key: "list:global:allow", label: "Global allowlist", description: "Allowed in every project" },
   { key: "list:global:deny", label: "Global blocklist", description: "Blocked in every project" },
   { key: "openState", label: "Open state folder", description: "Settings, lists, sandbox homes and sandbox.log; opens in your file manager" },
+  {
+    key: "removeFiles",
+    label: "Remove sandbox files for this project",
+    description:
+      "Deletes this project's sandbox home folder and its saved settings and allow/block lists, after you confirm. The project itself is not touched.",
+  },
 ];
 
 /**

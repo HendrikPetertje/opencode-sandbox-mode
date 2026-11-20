@@ -27,6 +27,7 @@ interface AskInfo {
   target: string;
   command?: string;
   deadline: number;
+  quiet?: boolean;
 }
 
 interface Payload {
@@ -43,6 +44,8 @@ interface Payload {
   askSupported: boolean;
   linkedNetwork: boolean;
   asks: AskInfo[];
+  /** The sandbox home of this project and whether the sandbox left any files for it. */
+  files?: { home: string; exists: boolean };
 }
 
 type ListView = { scope: "project" | "global"; kind: "allow" | "deny" };
@@ -252,7 +255,7 @@ export default Plugin.define({
           {live().command && <text fg={COLOR.muted as any} wrapMode="word">{`probably from: ${live().command}`}</text>}
           <text fg={COLOR.muted as any}>{live().directory}</text>
           <box height={1} />
-          <text fg={(left() <= 5 ? COLOR.love : COLOR.gold) as any}>{`${left()}s left, then the connection is refused and the agent stops`}</text>
+          <text fg={(left() <= 5 ? COLOR.love : COLOR.gold) as any}>{`${left()}s left, then the connection is refused${live().quiet ? "" : " and the agent stops"}`}</text>
           <box height={1} />
           <box flexDirection="row" gap={2}>
             <Choice label="(a)llow" choice="allow" color={COLOR.foam} />
@@ -309,6 +312,7 @@ export default Plugin.define({
         const setting = state()?.rows[row()];
         if (!setting) return;
         if (setting.key === "openState") return step === 1 ? openStateFolder() : undefined;
+        if (setting.key === "removeFiles") return step === 1 ? void removeFiles() : undefined;
         const list = listKey(setting.key);
         if (list) return step === 1 ? openList(list) : undefined;
         void call("setSetting", props.sessionID, { key: setting.key, step });
@@ -323,6 +327,44 @@ export default Plugin.define({
         scroll?.scrollTo(Math.max(0, row() - 5));
       };
       const toggle = () => void call("toggle", props.sessionID, {});
+
+      const removeFiles = async () => {
+        const current = state();
+        if (!current || current.enabled) return;
+        if (!current.files?.exists) {
+          context.ui.toast.show({ variant: "info", title: "Sandbox", message: "The sandbox left no files for this project." });
+          return;
+        }
+        const allow = current.lists.project.allow.length;
+        const deny = current.lists.project.deny.length;
+        const confirmed = await context.ui.dialog.confirm({
+          title: "Remove sandbox files for this project?",
+          message: [
+            current.directory,
+            "",
+            `This deletes the sandbox home folder (${current.files.home}) and this project's saved settings and allow/block lists (${allow} allow, ${deny} block).`,
+            "",
+            "Cancel first if you want to keep any white-listed or black-listed hosts: move them to the global lists (open the project list and press p).",
+            "",
+            "The project itself is not touched. This can't be undone.",
+          ].join("\n"),
+          label: { confirm: "Remove", cancel: "Cancel" },
+        });
+        if (confirmed) {
+          try {
+            const reply = await rpc().removeFiles({ sessionID: props.sessionID, directory: directory() });
+            store_(props.sessionID, reply);
+            context.ui.toast.show(
+              reply?.removed
+                ? { variant: "success", title: "Sandbox", message: "Removed the sandbox files for this project." }
+                : { variant: "warning", title: "Sandbox", message: String(reply?.reason ?? "Nothing was removed.") },
+            );
+          } catch (error) {
+            context.ui.toast.show({ variant: "error", title: "Sandbox", message: `Couldn't remove the files: ${(error as Error)?.message ?? error}` });
+          }
+        }
+        open(props.sessionID, undefined, row());
+      };
 
       const promptPattern = async (title: string, value: string) => {
         const list = view()!;
@@ -415,6 +457,7 @@ export default Plugin.define({
       const on = () => state()?.enabled ?? false;
       const valueText = (setting: SettingRow) => {
         if (setting.key === "openState") return stateFolderLabel();
+        if (setting.key === "removeFiles") return on() ? "disabled" : state()?.files?.exists ? "›" : "nothing to remove";
         const list = listKey(setting.key);
         if (list) {
           const count = state()?.lists[list.scope][list.kind].length ?? 0;
@@ -429,6 +472,7 @@ export default Plugin.define({
         return typeof value === "boolean" ? (value ? "on" : "off") : String(value);
       };
       const valueColor = (setting: SettingRow) => {
+        if (setting.key === "removeFiles") return !on() && state()?.files?.exists ? COLOR.love : COLOR.muted;
         if (setting.key === "openState" || listKey(setting.key)) return COLOR.iris;
         if (setting.key === "localhost" && linked()) return COLOR.muted;
         const value = state()?.settings[setting.key as keyof ProjectSettings];
@@ -436,6 +480,13 @@ export default Plugin.define({
         return VALUE_COLOR[String(value)] ?? COLOR.gold;
       };
 
+      // The label column fits the longest label shown (the remove row only exists while the sandbox is off).
+      const labelWidth = () => Math.max(20, ...(state()?.rows ?? []).map((setting) => setting.label.length + 1));
+      const description = () => {
+        const setting = state()?.rows[row()];
+        if (setting?.key === "removeFiles" && on()) return "This option is disabled while the sandbox is enabled";
+        return setting?.description ?? "";
+      };
       const Settings = () => (
         <scrollbox ref={(el: any) => (scroll = el)} flexGrow={1} flexBasis={0} minHeight={0}>
           {(state()?.rows ?? []).map((setting, index) => (
@@ -449,16 +500,19 @@ export default Plugin.define({
                 change(1);
               }}
             >
-              <text fg={(listKey(setting.key) || setting.key === "openState" ? COLOR.iris : ctx.theme.text.base) as any} width={20}>
+              <text
+                fg={(setting.key === "removeFiles" ? (on() ? COLOR.muted : COLOR.love) : listKey(setting.key) || setting.key === "openState" ? COLOR.iris : ctx.theme.text.base) as any}
+                width={labelWidth()}
+              >
                 {setting.label}
               </text>
-              <text fg={(on() ? valueColor(setting) : COLOR.muted) as any} attributes={TextAttributes.BOLD}>
+              <text fg={(on() || setting.key === "removeFiles" ? valueColor(setting) : COLOR.muted) as any} attributes={TextAttributes.BOLD}>
                 {valueText(setting)}
               </text>
             </box>
           ))}
           <box height={1} flexShrink={0} />
-          <text fg={COLOR.muted as any} wrapMode="word">{state()?.rows[row()]?.description ?? ""}</text>
+          <text fg={COLOR.muted as any} wrapMode="word">{description()}</text>
           <box height={1} flexShrink={0} />
           {linked() && (
             <text fg={COLOR.muted as any} wrapMode="word">

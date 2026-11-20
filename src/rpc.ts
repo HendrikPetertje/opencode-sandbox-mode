@@ -19,6 +19,7 @@ export const SandboxMode = Rpc.define({
     listPromote: { input: object, output: object },
     answer: { input: object, output: object },
     release: { input: object, output: object },
+    removeFiles: { input: object, output: object },
   },
   events: {
     changed: { schema: object },

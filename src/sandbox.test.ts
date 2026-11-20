@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
 import { createServer, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bwrapArgs, seatbelt, seatbeltProfile, type Spec } from "./backend.ts";
-import { adjust, parseOptions, resolveOptions, stripJsonc } from "./options.ts";
+import { adjust, parseOptions, resolveOptions, SETTING_ROWS, stripJsonc } from "./options.ts";
 import { linkIntoHome, lockedPaths } from "./paths.ts";
-import { loadProject, projectFile, saveProject } from "./state.ts";
+import { matchesName, sandboxServer } from "./mcp.ts";
+import { hasProjectFiles, homeDir, loadProject, projectFile, removeProjectFiles, saveProject } from "./state.ts";
 import { exact, judge } from "./patterns.ts";
 import { startProxy } from "./proxy.ts";
 
@@ -227,5 +228,127 @@ describe("config lock", () => {
     const result = spawnSync("/bin/sh", ["-c", command], { encoding: "utf8" });
     expect(result.stdout).toContain("project-write=ok");
     expect(result.stdout).not.toContain("locked-write=ok");
+  });
+});
+
+describe("sandboxMcp network", () => {
+  test("proxied servers only reach the proxy; without one they get nothing", () => {
+    const saved = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-mcp-net-"));
+    try {
+      const context = { backend: seatbelt, credentialPaths: [], homeLinks: [] };
+      const proxied = sandboxServer("p", { type: "local", command: ["x"] }, { ...context, proxyPort: 4321 });
+      const direct = sandboxServer("q", { type: "local", command: ["x"] }, context);
+      if (!proxied.ok || !direct.ok) throw new Error("not wrapped");
+      const profile = proxied.server.command![2]!;
+      expect(profile).toContain('(remote ip "localhost:4321")');
+      expect(profile).toContain("(deny network-outbound)");
+      expect(profile).not.toContain('(remote ip "localhost:*")');
+      expect(proxied.server.environment).toMatchObject({ HTTPS_PROXY: "http://127.0.0.1:4321", ALL_PROXY: "socks5h://127.0.0.1:4321", NO_PROXY: "", NODE_USE_ENV_PROXY: "1" });
+      expect(direct.server.command![2]).not.toContain("localhost:");
+      expect(direct.server.environment).not.toHaveProperty("HTTPS_PROXY");
+    } finally {
+      if (saved === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = saved;
+    }
+  });
+});
+
+describe("sandboxMcp", () => {
+  test("entries are names or objects with args", () => {
+    expect(parseOptions({ sandboxMcp: ["a*", { name: "b", args: ["--x", 1] }, { args: [] }, 3] }).sandboxMcp).toEqual([
+      { name: "a*", args: [] },
+      { name: "b", args: ["--x"] },
+    ]);
+  });
+  test("names match with * and ignore case", () => {
+    expect(matchesName("dummy-everything", ["dummy-everything*"])).toBe(true);
+    expect(matchesName("Dummy-Everything-extra", ["dummy-everything*"])).toBe(true);
+    expect(matchesName("dummy-everything", ["dummy-everything-*"])).toBe(false);
+    expect(matchesName("github", ["dummy-everything*"])).toBe(false);
+    expect(matchesName("a.b", ["a.b"])).toBe(true);
+    expect(matchesName("axb", ["a.b"])).toBe(false);
+  });
+  test("a local server is wrapped, with its own HOME; remote ones are left alone", () => {
+    const saved = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-mcp-"));
+    try {
+      const context = { backend: seatbelt, credentialPaths: ["/home/me/.ssh"], homeLinks: [] };
+      const result = sandboxServer("dummy-everything", { type: "local", command: ["npx", "@modelcontextprotocol/server-everything"], environment: { A: "1" } }, context);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const [exec, flag, profile, ...rest] = result.server.command!;
+      expect(exec).toBe("/usr/bin/sandbox-exec");
+      expect(flag).toBe("-p");
+      expect(profile).toContain("(deny file-write*)");
+      expect(profile).toContain("/home/me/.ssh");
+      expect(rest).toEqual(["npx", "@modelcontextprotocol/server-everything"]);
+      const withArgs = sandboxServer("dummy-everything", { type: "local", command: ["npx", "x"] }, { ...context, args: ["--no-sandbox"] });
+      if (withArgs.ok) expect(withArgs.server.command!.slice(-3)).toEqual(["npx", "x", "--no-sandbox"]);
+      expect(result.server.environment).toMatchObject({ A: "1", OPENCODE_SANDBOX: "seatbelt" });
+      expect(result.server.environment!.HOME).toBe(result.server.cwd!);
+      expect(result.server.environment!.HOME).toContain("opencode-sandbox-mode/mcp/dummy-everything");
+      expect(sandboxServer("x", result.server, context)).toMatchObject({ ok: true, server: result.server });
+      expect(sandboxServer("remote", { type: "remote" }, context)).toMatchObject({ ok: false });
+    } finally {
+      if (saved === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = saved;
+    }
+  });
+  test("live: a wrapped program can't write outside its folder", () => {
+    if (process.platform !== "darwin" || process.env.OPENCODE_SANDBOX) return;
+    const saved = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = realpathSync(mkdtempSync(join(tmpdir(), "sbx-mcp-live-")));
+    try {
+      const outside = realpathSync(mkdtempSync(join(process.env.HOME ?? "/Users", ".sbx-outside-")));
+      const result = sandboxServer("live", { type: "local", command: ["/bin/sh", "-c", `touch "$HOME/ok" && echo home=ok; touch ${outside}/nope 2>/dev/null && echo outside=ok`] }, { backend: seatbelt, credentialPaths: [], homeLinks: [] });
+      if (!result.ok) throw new Error(result.reason);
+      const [program, ...args] = result.server.command!;
+      const run = spawnSync(program!, args, { encoding: "utf8", env: { ...process.env, ...result.server.environment }, cwd: result.server.cwd });
+      spawnSync("rmdir", [outside]);
+      expect(run.stdout).toContain("home=ok");
+      expect(run.stdout).not.toContain("outside=ok");
+    } finally {
+      if (saved === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = saved;
+    }
+  });
+});
+
+describe("remove sandbox files", () => {
+  test("deletes the home and the saved state of one project, and keeps symlink targets and other projects", () => {
+    const saved = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-rm-"));
+    try {
+      const outside = mkdtempSync(join(tmpdir(), "sbx-rm-target-"));
+      writeFileSync(join(outside, "npmrc"), "min-release-age=2\n");
+      const [a, b] = ["/work/a", "/work/b"];
+      for (const directory of [a!, b!]) {
+        mkdirSync(join(homeDir(directory), ".cache"), { recursive: true });
+        saveProject({ directory, settings: settings, lists: { allow: ["^x$"], deny: [] } });
+      }
+      symlinkSync(join(outside, "npmrc"), join(homeDir(a!), ".npmrc"));
+      expect(hasProjectFiles(a!)).toBe(true);
+
+      removeProjectFiles(a!);
+
+      expect(hasProjectFiles(a!)).toBe(false);
+      expect(existsSync(homeDir(a!))).toBe(false);
+      expect(existsSync(projectFile(a!))).toBe(false);
+      expect(readFileSync(join(outside, "npmrc"), "utf8")).toContain("min-release-age=2");
+      expect(hasProjectFiles(b!)).toBe(true);
+      expect(loadProject(b!, parseOptions({})).lists.allow).toEqual(["^x$"]);
+      expect(() => removeProjectFiles(a!)).not.toThrow();
+    } finally {
+      if (saved === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = saved;
+    }
+  });
+  test("the row is the last one and is not a setting", () => {
+    expect(SETTING_ROWS.at(-1)).toMatchObject({ key: "removeFiles", label: "Remove sandbox files for this project" });
+    expect("removeFiles" in settings).toBe(false);
+  });
+  test("the description does not mention when the row is available", () => {
+    expect(SETTING_ROWS.at(-1)?.description).not.toMatch(/only shown|hidden/i);
   });
 });

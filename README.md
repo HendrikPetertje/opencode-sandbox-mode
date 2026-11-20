@@ -154,7 +154,8 @@ Only the agent's `shell` tool runs in the sandbox. OpenCode's own file tools
 
 `webfetch` also runs in OpenCode itself, but its host goes through the same
 network-out setting, lists and Ask popup as shell commands. With network out
-on closed, it's denied. MCP servers and `websearch` aren't covered.
+on closed, it's denied. `websearch` isn't covered. MCP servers aren't either, unless you list them in
+[`sandboxMcp`](#mcp-servers).
 
 | Setting | Default | On |
 | --- | --- | --- |
@@ -165,9 +166,23 @@ on closed, it's denied. MCP servers and `websearch` aren't covered.
 | Sandbox home | on | `HOME` is an empty per-project folder under `~/.local/state/opencode-sandbox-mode/homes/` |
 | Protect hooks | on | `.git/hooks`, `.git/config`, `.opencode` and `.envrc` are read-only |
 | Block credentials | on | `credentialPaths` can't be read or written |
+| Remove sandbox files for this project | | The last row. Greyed out and disabled while the sandbox is on. When it is off, it deletes this project's sandbox home folder and its saved settings and allow/block lists, after a confirmation. See [Cleaning up](#cleaning-up) |
 | Lock opencode config edits | on | The OpenCode config can't be changed, so a poisoned agent can't weaken or switch off the sandbox. See [Config lock](#config-lock) |
 
 Commands in the sandbox see `OPENCODE_SANDBOX=seatbelt` (or `bubblewrap`).
+
+### Cleaning up
+
+Everything the sandbox makes lives in `~/.local/state/opencode-sandbox-mode/` and **stays after a reboot**: the sandbox
+home of each project (`homes/<hash>/`), its saved settings and lists (`projects/<hash>.json`), the folders of
+sandboxed MCP servers (`mcp/<name>/`), the global lists and the log. While the sandbox is off for a project, the last
+row of the settings modal, **Remove sandbox files for this project**, deletes that project's home folder and its
+saved settings and lists, after you confirm. (The row is greyed out while the sandbox is on.) The confirmation reminds
+you that the project's allow and block lists go with it: move the entries you want to keep to the global lists first
+(open the project list and press `p`). The project itself is not touched, and neither are the targets of
+`homeLinks` (the symlinks in the home are removed, not followed). The next time you open the modal for the project it
+starts from the defaults again. MCP server folders, the global lists and the log are not per project; delete them
+from the state folder by hand (**Open state folder** opens it).
 
 ### Config lock
 
@@ -188,6 +203,52 @@ The lock is never stored. It is on whenever the sandbox is turned on and after
 every OpenCode start; switching it off in the settings modal is a deliberate
 step each time. Add `service.json` (the server password, which can drive the
 plugin's RPC) to `credentialPaths` so a shell command can't read it.
+
+### MCP servers
+
+MCP servers run outside the sandbox. This is opt-in: list local servers in
+`sandboxMcp` and the plugin rewrites their `command` so they start inside it.
+
+```jsonc
+"sandboxMcp": [
+  "my-server",
+  "tools-*",
+  { "name": "other", "args": ["--some-flag"] }
+]
+```
+
+A name matches the server's name in your `mcp` config (case-insensitive, `*` matches anything). An object can also
+carry `args`, which are added to the command only while it is sandboxed.
+
+- **When:** per project. A project's servers are wrapped while the sandbox is on for that project. Turning it off puts
+  the original command back, and the servers restart either way.
+- **Files:** each server gets its own folder under `~/.local/state/opencode-sandbox-mode/mcp/<name>` as `HOME` and
+  working folder. It can only write there and to the temp folders. `homeLinks`, `credentialPaths` and the config lock
+  apply as for shell commands.
+- **Network:** the servers of a project go through that project's own proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  and `NODE_USE_ENV_PROXY=1` so Node's own `fetch` uses it too). Direct connections, localhost included, and listening
+  on ports are blocked, so a tool that ignores the proxy settings has no network. The network setting and the lists
+  are the project's (plus the global ones) and work like for shell commands: the ask popup, the toast, the one-off
+  allow and reject answers, and white-listing and black-listing into the project's lists.
+- **Which session is asked:** a server is shared by all sessions of its project, so a connection is attributed to the
+  session whose tool call is in flight (the latest one). The popup and the stop-the-agent timeout then work as for
+  that session's shell commands. With no call in flight (a server starting up) the project's most recently used
+  session gets the popup, but the agent is not stopped when you don't answer. With no session at all, only the lists
+  decide. If two sessions of one project call servers at the same moment, the latest call gets the popup. Decisions
+  are logged as `mcp.network` in `sandbox.log`.
+- **Fails closed:** if the sandbox can't start, the server is disabled rather than run without it.
+- **Not covered:** remote servers (nothing runs locally), servers started through a container runtime such as
+  `podman run` (the container isn't inside the wrapper), and single tools: they run inside their server's process, so
+  the sandbox is per server. On Linux there is no network bridge for this yet: servers get no network.
+- **Programs with their own sandbox** (browsers) can't start it inside this one. Pass whatever disables it, and
+  anything the empty `HOME` lacks, through `args`.
+
+**Pre-white-list package registries.** A server started with `npx`, `uvx` or similar downloads its package on every
+start, and that goes through the proxy. In ask mode the first start would open a popup (and with no session in use it
+is refused), so allow the registry up front, in the project or global allow list or in the `allow` option:
+`^registry\.npmjs\.org:443$` for npm (the registry host, not `api.npmjs.org`, which only serves download statistics),
+or your company's registry if you use one. Python tools need `^pypi\.org:443$` and `^files\.pythonhosted\.org:443$`.
+The servers' own hosts (an API, a website) are best allowed on first use through the popup.
 
 ### Linux
 
@@ -260,6 +321,7 @@ A new session checks again.
 | `blockCredentials` | `true` | |
 | `credentialPaths` | `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.gnupg`, `~/.docker/config.json`, `~/.kube`, `~/.netrc`, `~/.npmrc`, `~/.git-credentials`, `~/.local/share/opencode/auth.json` | Replaces the default list, so repeat the defaults you want to keep |
 | `homeLinks` | `[]` | Paths in your real home (`~/...`) that are symlinked into the sandbox home at the same relative path, so tools still find their config there (e.g. `~/.npmrc`). Skipped if the path is missing, outside your home, or inside a credential path. |
+| `sandboxMcp` | `[]` | Local MCP servers that only start inside the sandbox: a name (`*` matches anything, e.g. `my-server-*`) or `{ "name": "...", "args": ["..."] }`. The `args` are added to the command only while it is sandboxed. See [MCP servers](#mcp-servers) |
 | `extends` | none | Path to a `.jsonc` file with more options. Relative paths are relative to the OpenCode config folder, `~` works. Keys in that file override the inline ones, and a missing file is ignored, so it can be git-ignored. A broken file is logged in `sandbox.log` |
 | `allow` | `[]` | Global allowlist entries (regexes) |
 | `deny` | `[]` | Global blocklist entries (regexes) |
@@ -283,8 +345,8 @@ A new session checks again.
 - **Without sandbox home**, `zsh -c` still reads `~/.zshenv`. If that file
   is inside a credential path, every command prints a permission error.
 - **Only the agent's shell commands are sandboxed.** Your own `!` commands
-  might be wrapped too (they go through the same hook); MCP servers and
-  OpenCode itself aren't.
+  might be wrapped too (they go through the same hook). MCP servers only if you
+  list them in `sandboxMcp`; OpenCode itself isn't.
 
 ## Files
 

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Options, ProjectSettings } from "./options.ts";
 import { projectHash, stateDir } from "./paths.ts";
@@ -33,6 +33,20 @@ const stringList = (value: unknown): string[] => (Array.isArray(value) ? value.f
 
 export const projectFile = (directory: string) => join(stateDir(), "projects", `${projectHash(directory)}.json`);
 export const globalFile = () => join(stateDir(), "global.json");
+/** The sandbox HOME of a project. */
+export const homeDir = (directory: string) => join(stateDir(), "homes", projectHash(directory));
+
+/** Whether the sandbox left anything on disk for this project. */
+export const hasProjectFiles = (directory: string) => existsSync(homeDir(directory)) || existsSync(projectFile(directory));
+
+/**
+ * Deletes what the sandbox made for one project: its home folder and its saved settings and lists. Symlinks in the
+ * home (`homeLinks`) are removed, never followed, so their targets stay.
+ */
+export function removeProjectFiles(directory: string): void {
+  rmSync(homeDir(directory), { recursive: true, force: true });
+  rmSync(projectFile(directory), { force: true });
+}
 
 /**
  * Project files are created from the plugin options the first time a project
