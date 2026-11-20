@@ -19,6 +19,8 @@ export interface ProjectSettings {
   blockCredentials: boolean;
   /** Keeps the OpenCode config read-only. Never stored: it is on again every time the sandbox is turned on. */
   lockConfig: boolean;
+  /** Sandboxed MCP servers of the project may write to the project folder (reading is always allowed). */
+  mcpProjectWrite: boolean;
 }
 
 export interface Options {
@@ -126,6 +128,7 @@ export function parseOptions(raw: Record<string, unknown> | undefined): Options 
       protectHooks: bool(options.protectHooks, true),
       blockCredentials: bool(options.blockCredentials, true),
       lockConfig: true,
+      mcpProjectWrite: bool(options.mcpProjectWrite, false),
     },
     keybind: typeof options.keybind === "string" && options.keybind.trim() ? options.keybind.trim() : "<leader>o",
     askTimeoutSeconds: seconds(options.askTimeoutSeconds, 20),
@@ -141,7 +144,7 @@ export function parseOptions(raw: Record<string, unknown> | undefined): Options 
 export type SettingKey = Exclude<keyof ProjectSettings, "enabled">;
 
 export interface SettingRow {
-  key: SettingKey | "list:project:allow" | "list:project:deny" | "list:global:allow" | "list:global:deny" | "openState" | "removeFiles";
+  key: SettingKey | "list:project:allow" | "list:project:deny" | "list:global:allow" | "list:global:deny" | "openState" | "removeFiles" | "sandboxes";
   label: string;
   description: string;
 }
@@ -160,6 +163,12 @@ export const SETTING_ROWS: SettingRow[] = [
     description:
       "OpenCode config, this plugin's state and homeLinks targets can't be changed: file tools are denied and shell writes blocked. Switches back on every time the sandbox is turned on",
   },
+  {
+    key: "mcpProjectWrite",
+    label: "MCP writes to project",
+    description:
+      "Sandboxed MCP servers (sandboxMcp) of this project may write to the project folder and start in it. They can always read it. Git hooks, git config and the OpenCode config stay read-only. Servers restart when you change this.",
+  },
   { key: "list:project:allow", label: "Project allowlist", description: "Regexes on host:port this project may connect to" },
   { key: "list:project:deny", label: "Project blocklist", description: "Regexes on host:port this project may never connect to" },
   { key: "list:global:allow", label: "Global allowlist", description: "Allowed in every project" },
@@ -170,6 +179,12 @@ export const SETTING_ROWS: SettingRow[] = [
     label: "Remove sandbox files for this project",
     description:
       "Deletes this project's sandbox home folder and its saved settings and allow/block lists, after you confirm. The project itself is not touched.",
+  },
+  {
+    key: "sandboxes",
+    label: "List all sandboxes",
+    description:
+      "Every sandbox on this machine, also those of projects you are not in. Shows which are in use, and wipes the inactive ones, for example when a project folder was removed. Folders that no longer exist are yellow.",
   },
 ];
 

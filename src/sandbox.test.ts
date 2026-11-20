@@ -8,7 +8,9 @@ import { bwrapArgs, seatbelt, seatbeltProfile, type Spec } from "./backend.ts";
 import { adjust, parseOptions, resolveOptions, SETTING_ROWS, stripJsonc } from "./options.ts";
 import { linkIntoHome, lockedPaths } from "./paths.ts";
 import { matchesName, sandboxServer } from "./mcp.ts";
-import { hasProjectFiles, homeDir, loadProject, projectFile, removeProjectFiles, saveProject } from "./state.ts";
+import { FRESH_MS, listSandboxes, readLive, removeLive, writeLive } from "./sandboxes.ts";
+import { projectHash } from "./paths.ts";
+import { hasProjectFiles, homeDir, removeProjectFilesByHash, loadProject, projectFile, removeProjectFiles, saveProject } from "./state.ts";
 import { exact, judge } from "./patterns.ts";
 import { startProxy } from "./proxy.ts";
 
@@ -184,10 +186,16 @@ describe("config lock", () => {
     const row = adjust(settings, "lockConfig", 1);
     expect(row.lockConfig).toBe(false);
     const dir = mkdtempSync(join(tmpdir(), "sbx-lock-"));
-    const state = { directory: dir, settings: row, lists: { allow: [], deny: [] } };
-    saveProject(state);
-    expect(JSON.parse(readFileSync(projectFile(dir), "utf8")).settings.lockConfig).toBeUndefined();
-    expect(loadProject(dir, parseOptions({})).settings.lockConfig).toBe(true);
+    const savedState = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-lock-state-"));
+    try {
+      saveProject({ directory: dir, settings: row, lists: { allow: [], deny: [] } });
+      expect(JSON.parse(readFileSync(projectFile(dir), "utf8")).settings.lockConfig).toBeUndefined();
+      expect(loadProject(dir, parseOptions({})).settings.lockConfig).toBe(true);
+    } finally {
+      if (savedState === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = savedState;
+    }
   });
   test("lockedPaths covers config, state, project config files and homeLinks targets", () => {
     const paths = lockedPaths("/work/project", ["~/.npmrc"]);
@@ -236,7 +244,7 @@ describe("sandboxMcp network", () => {
     const saved = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-mcp-net-"));
     try {
-      const context = { backend: seatbelt, credentialPaths: [], homeLinks: [] };
+      const context = { backend: seatbelt, credentialPaths: [], homeLinks: [], project: "/work/proj" };
       const proxied = sandboxServer("p", { type: "local", command: ["x"] }, { ...context, proxyPort: 4321 });
       const direct = sandboxServer("q", { type: "local", command: ["x"] }, context);
       if (!proxied.ok || !direct.ok) throw new Error("not wrapped");
@@ -273,7 +281,7 @@ describe("sandboxMcp", () => {
     const saved = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-mcp-"));
     try {
-      const context = { backend: seatbelt, credentialPaths: ["/home/me/.ssh"], homeLinks: [] };
+      const context = { backend: seatbelt, credentialPaths: ["/home/me/.ssh"], homeLinks: [], project: "/work/proj" };
       const result = sandboxServer("dummy-everything", { type: "local", command: ["npx", "@modelcontextprotocol/server-everything"], environment: { A: "1" } }, context);
       expect(result.ok).toBe(true);
       if (!result.ok) return;
@@ -287,7 +295,8 @@ describe("sandboxMcp", () => {
       if (withArgs.ok) expect(withArgs.server.command!.slice(-3)).toEqual(["npx", "x", "--no-sandbox"]);
       expect(result.server.environment).toMatchObject({ A: "1", OPENCODE_SANDBOX: "seatbelt" });
       expect(result.server.environment!.HOME).toBe(result.server.cwd!);
-      expect(result.server.environment!.HOME).toContain("opencode-sandbox-mode/mcp/dummy-everything");
+      expect(result.server.environment!.HOME).toContain("opencode-sandbox-mode/mcp/dummy-everything/");
+      expect(result.server.environment!.HOME.endsWith(projectHash("/work/proj"))).toBe(true);
       expect(sandboxServer("x", result.server, context)).toMatchObject({ ok: true, server: result.server });
       expect(sandboxServer("remote", { type: "remote" }, context)).toMatchObject({ ok: false });
     } finally {
@@ -301,7 +310,7 @@ describe("sandboxMcp", () => {
     process.env.XDG_STATE_HOME = realpathSync(mkdtempSync(join(tmpdir(), "sbx-mcp-live-")));
     try {
       const outside = realpathSync(mkdtempSync(join(process.env.HOME ?? "/Users", ".sbx-outside-")));
-      const result = sandboxServer("live", { type: "local", command: ["/bin/sh", "-c", `touch "$HOME/ok" && echo home=ok; touch ${outside}/nope 2>/dev/null && echo outside=ok`] }, { backend: seatbelt, credentialPaths: [], homeLinks: [] });
+      const result = sandboxServer("live", { type: "local", command: ["/bin/sh", "-c", `touch "$HOME/ok" && echo home=ok; touch ${outside}/nope 2>/dev/null && echo outside=ok`] }, { backend: seatbelt, credentialPaths: [], homeLinks: [], project: "/work/proj" });
       if (!result.ok) throw new Error(result.reason);
       const [program, ...args] = result.server.command!;
       const run = spawnSync(program!, args, { encoding: "utf8", env: { ...process.env, ...result.server.environment }, cwd: result.server.cwd });
@@ -344,11 +353,134 @@ describe("remove sandbox files", () => {
       else process.env.XDG_STATE_HOME = saved;
     }
   });
-  test("the row is the last one and is not a setting", () => {
-    expect(SETTING_ROWS.at(-1)).toMatchObject({ key: "removeFiles", label: "Remove sandbox files for this project" });
+  test("the rows are the last ones and not settings", () => {
+    expect(SETTING_ROWS.at(-2)).toMatchObject({ key: "removeFiles", label: "Remove sandbox files for this project" });
+    expect(SETTING_ROWS.at(-1)).toMatchObject({ key: "sandboxes", label: "List all sandboxes" });
     expect("removeFiles" in settings).toBe(false);
   });
   test("the description does not mention when the row is available", () => {
-    expect(SETTING_ROWS.at(-1)?.description).not.toMatch(/only shown|hidden/i);
+    expect(SETTING_ROWS.at(-2)?.description).not.toMatch(/only shown|hidden/i);
+  });
+});
+
+describe("list all sandboxes", () => {
+  const withState = <T,>(run: () => T): T => {
+    const saved = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-list-"));
+    try {
+      return run();
+    } finally {
+      if (saved === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = saved;
+    }
+  };
+  const make = (directory: string, enabled = false, allow = ["^x$"]) => {
+    mkdirSync(homeDir(directory), { recursive: true });
+    saveProject({ directory, settings: { ...settings, enabled }, lists: { allow, deny: [] } });
+  };
+
+  test("lists projects, marks missing folders, and finds leftover homes without a settings file", () =>
+    withState(() => {
+      const there = realpathSync(mkdtempSync(join(tmpdir(), "sbx-there-")));
+      make(there);
+      make("/gone/project", true, ["^a$", "^b$"]);
+      mkdirSync(join(process.env.XDG_STATE_HOME!, "opencode-sandbox-mode", "homes", "0123456789abcdef"), { recursive: true });
+      const list = listSandboxes({ pid: process.pid, current: there });
+      expect(list).toHaveLength(3);
+      const byDir = (directory: string | null) => list.find((info) => info.directory === directory)!;
+      expect(byDir(there)).toMatchObject({ exists: true, enabled: false, live: false, current: true, allow: 1, hasHome: true });
+      expect(byDir("/gone/project")).toMatchObject({ exists: false, enabled: true, live: false, allow: 2 });
+      expect(byDir(null)).toMatchObject({ hash: "0123456789abcdef", exists: false, hasHome: true });
+      // In use first, then missing folders, then the rest.
+      expect(list.map((info) => info.directory)).toEqual(["/gone/project", null, there]);
+    }));
+
+  test("a project is live only with a fresh heartbeat of a running process", () =>
+    withState(() => {
+      const [a, b, c] = ["/work/a", "/work/b", "/work/c"] as const;
+      for (const directory of [a, b, c]) make(directory, true);
+      writeLive(process.pid, [a]);
+      writeLive(process.ppid, [b]);
+      expect(listSandboxes({ pid: process.pid }).map((info) => [info.directory, info.here, info.elsewhere, info.live])).toEqual([
+        [a, true, false, true],
+        [b, false, true, true],
+        [c, false, false, false],
+      ]);
+      // A stale heartbeat and a dead process don't count, and their files are cleaned up.
+      writeLive(process.ppid, [b], Date.now() - FRESH_MS - 1000);
+      expect(readLive().has(b)).toBe(false);
+      const dead = Bun.spawnSync(["true"]).pid;
+      writeLive(dead, [c]);
+      expect(readLive().has(c)).toBe(false);
+      removeLive(process.pid);
+      expect(readLive().size).toBe(0);
+    }));
+
+  test("wiping by hash removes one sandbox only", () =>
+    withState(() => {
+      make("/work/a");
+      make("/work/b");
+      removeProjectFilesByHash(projectHash("/work/a"));
+      expect(listSandboxes({ pid: process.pid }).map((info) => info.directory)).toEqual(["/work/b"]);
+      expect(() => removeProjectFilesByHash(projectHash("/work/a"))).not.toThrow();
+    }));
+});
+
+describe("MCP access to the project", () => {
+  const wrap = (projectWrite: boolean) => {
+    const saved = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-mcp-proj-"));
+    try {
+      const result = sandboxServer("srv", { type: "local", command: ["x"] }, { backend: seatbelt, credentialPaths: [], homeLinks: [], project: "/work/proj", projectWrite });
+      if (!result.ok) throw new Error(result.reason);
+      return result.server;
+    } finally {
+      if (saved === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = saved;
+    }
+  };
+  test("by default a server only writes its own folder and starts there", () => {
+    const server = wrap(false);
+    const profile = server.command![2]!;
+    expect(profile).toContain("(deny file-write*)");
+    const allow = profile.split("\n").find((line) => line.startsWith("(allow file-write*"))!;
+    expect(allow).not.toContain('"/work/proj"');
+    expect(allow).toContain(server.environment!.HOME);
+    expect(server.cwd).toBe(server.environment!.HOME);
+  });
+  test("with project write the project is writable and the server starts in it, with git and OpenCode config read-only", () => {
+    const server = wrap(true);
+    const profile = server.command![2]!;
+    const lines = profile.split("\n");
+    const allow = lines.find((line) => line.startsWith("(allow file-write*"))!;
+    expect(allow).toContain('"/work/proj"');
+    expect(allow).toContain(server.environment!.HOME);
+    expect(server.cwd).toBe("/work/proj");
+    expect(profile).toContain('(subpath "/work/proj/.git/hooks")');
+    expect(profile).toContain('(subpath "/work/proj/opencode.jsonc")');
+    expect(profile).toContain('(subpath "/work/proj/.opencode")');
+    // The server's own folder (inside the locked state folder) stays writable.
+    expect(lines[lines.findIndex((line) => line.includes("(deny file-write* (subpath") && line.includes("/work/proj/opencode.jsonc")) + 1]).toContain(server.environment!.HOME);
+  });
+  test("the setting is a per-project boolean row, off by default", () => {
+    expect(settings.mcpProjectWrite).toBe(false);
+    expect(SETTING_ROWS.some((row) => row.key === "mcpProjectWrite")).toBe(true);
+    expect(adjust(settings, "mcpProjectWrite", 1).mcpProjectWrite).toBe(true);
+  });
+  test("wiping a project also removes its MCP server folders, and only those", () => {
+    const saved = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "sbx-mcp-wipe-"));
+    try {
+      const a = sandboxServer("one", { type: "local", command: ["x"] }, { backend: seatbelt, credentialPaths: [], homeLinks: [], project: "/work/a" });
+      const b = sandboxServer("one", { type: "local", command: ["x"] }, { backend: seatbelt, credentialPaths: [], homeLinks: [], project: "/work/b" });
+      if (!a.ok || !b.ok) throw new Error("not wrapped");
+      expect(listSandboxes({ pid: process.pid }).map((info) => info.hash).sort()).toEqual([projectHash("/work/a"), projectHash("/work/b")].sort());
+      removeProjectFilesByHash(projectHash("/work/a"));
+      expect(existsSync(a.server.environment!.HOME!)).toBe(false);
+      expect(existsSync(b.server.environment!.HOME!)).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = saved;
+    }
   });
 });

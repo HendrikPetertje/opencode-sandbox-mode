@@ -16,7 +16,8 @@ import { expandHome, isInside, linkIntoHome, lockedPaths, projectHash, real, sta
 import { exact, isValid, judge } from "./src/patterns.ts";
 import { startProxy, type Proxy } from "./src/proxy.ts";
 import { SandboxMode } from "./src/rpc.ts";
-import { hasProjectFiles, homeDir, loadGlobal, loadProject, removeProjectFiles, saveGlobal, saveProject, type Lists, type ProjectState } from "./src/state.ts";
+import { hasProjectFiles, homeDir, loadGlobal, loadProject, removeProjectFiles, removeProjectFilesByHash, saveGlobal, saveProject, type Lists, type ProjectState } from "./src/state.ts";
+import { countSandboxes, HEARTBEAT_MS, listSandboxes, removeLive, writeLive } from "./src/sandboxes.ts";
 
 const LOOKUP_TIMEOUT_MS = 3_000;
 const LOOKUP_ATTEMPTS = 4;
@@ -89,6 +90,9 @@ interface Shared {
   /** Live copies, newest last. The server runs one copy per location and a new one on every hot reload. */
   copies: Copy[];
   sweeper?: ReturnType<typeof setInterval>;
+  /** Writes this process's heartbeat: the projects it has the sandbox on for. */
+  heartbeat?: ReturnType<typeof setInterval>;
+  exitHook?: boolean;
   /** Read by the auto-mode plugin. */
   isSandboxed: (directory: string | undefined) => boolean;
 }
@@ -371,6 +375,7 @@ export default Plugin.define({
         settings: state.settings,
         rows: SETTING_ROWS,
         files: { home: homeDir(directory), exists: hasProjectFiles(directory) },
+        sandboxCount: countSandboxes(),
         lists: { project: state.lists, global: globalLists(), config: { allow: options.allow, deny: options.deny } },
         keybind: options.keybind,
         failed: info ? shared.failed.has(info.rootID) : false,
@@ -403,6 +408,16 @@ export default Plugin.define({
     const projectOf = async (input: any) =>
       project(input?.sessionID ? await sessionDir(input.sessionID, input?.directory) : input?.directory ?? fallbackDir());
 
+    /** The projects this process has the sandbox on for, for the heartbeat other OpenCodes read (see src/sandboxes.ts). */
+    const beat = () => {
+      try {
+        writeLive(process.pid, [...shared.projects.values()].filter((state) => state.settings.enabled).map((state) => state.directory));
+      } catch (error) {
+        logError("writing the heartbeat", error);
+      }
+    };
+    const sandboxList = (input: any, directory?: string) => listSandboxes({ pid: process.pid, current: directory ?? input?.directory });
+
     const registration = await ctx.rpc.register(SandboxMode, {
       state: async (input: any) => statePayload(input ?? {}),
       toggle: async (input: any) => {
@@ -411,6 +426,7 @@ export default Plugin.define({
         state.settings = { ...state.settings, enabled: !state.settings.enabled, lockConfig: true };
         save(state);
         emit("changed", {});
+        beat();
         await reloadMcp();
         return statePayload(input ?? {});
       },
@@ -420,6 +436,8 @@ export default Plugin.define({
         if (key in state.settings && key !== ("enabled" as string)) {
           state.settings = adjust(state.settings, key, input?.step === -1 ? -1 : 1, shared.backend?.linkedNetwork ?? false);
           save(state);
+          // MCP servers get their command (and the project folder as writable) when they start.
+          if (key === "mcpProjectWrite") await reloadMcp();
         }
         emit("changed", {});
         return statePayload(input ?? {});
@@ -508,6 +526,34 @@ export default Plugin.define({
         emit("changed", {});
         return { ...(await statePayload(input ?? {})), removed: true };
       },
+      sandboxes: async (input: any) => {
+        beat();
+        const directory = input?.sessionID ? await sessionDir(input.sessionID, input?.directory) : input?.directory ?? fallbackDir();
+        return json({ sandboxes: sandboxList(input, directory) });
+      },
+      removeSandbox: async (input: any) => {
+        const hash = String(input?.hash ?? "");
+        const directory = input?.sessionID ? await sessionDir(input.sessionID, input?.directory) : input?.directory ?? fallbackDir();
+        const fail = (reason: string) => json({ removed: false, reason, sandboxes: sandboxList(input, directory) });
+        if (!/^[0-9a-f]{16}$/.test(hash)) return fail("That is not a sandbox.");
+        beat();
+        const info = sandboxList(input, directory).find((entry) => entry.hash === hash);
+        if (!info) return fail("That sandbox no longer exists.");
+        if (info.live) {
+          return fail(info.here ? "The sandbox is on for this project in this OpenCode. Turn it off first." : "The sandbox is on in another OpenCode. Turn it off there first.");
+        }
+        try {
+          removeProjectFilesByHash(hash);
+        } catch (error) {
+          logError("removing a sandbox", error);
+          return fail(`Couldn't remove it: ${(error as Error)?.message ?? error}`);
+        }
+        // Cached state would write the old settings back on the next change.
+        for (const [key, state] of [...shared.projects]) if (projectHash(state.directory) === hash) shared.projects.delete(key);
+        log("sandbox.removed", { hash, directory: info.directory });
+        emit("changed", {});
+        return json({ removed: true, sandboxes: sandboxList(input, directory) });
+      },
       release: async (input: any) => {
         if (typeof input?.sessionID === "string") {
           const { rootID } = await sessionInfo(input.sessionID);
@@ -567,6 +613,20 @@ export default Plugin.define({
       for (const [id, call] of shared.calls) if (now - call.at > IDLE_RELEASE_MS) shared.calls.delete(id);
     }, SWEEP_EVERY_MS);
     (shared.sweeper as any).unref?.();
+
+    // Other OpenCodes (and this list in the settings) tell live sandboxes from stale ones by this heartbeat.
+    if (shared.heartbeat) clearInterval(shared.heartbeat);
+    shared.heartbeat = setInterval(beat, HEARTBEAT_MS);
+    (shared.heartbeat as any).unref?.();
+    if (!shared.exitHook) {
+      shared.exitHook = true;
+      process.on("exit", () => {
+        try {
+          removeLive(process.pid);
+        } catch {}
+      });
+    }
+    beat();
 
     // ---------------------------------------------------------------- hooks
 
@@ -720,7 +780,7 @@ export default Plugin.define({
             editor.update(name, (server: any) => void (server.disabled = true));
             continue;
           }
-          const result = sandboxServer(name, current, { backend, args: entry.args, proxyPort: mcpPort, credentialPaths: config.credentialPaths.map(expandHome), homeLinks: config.homeLinks });
+          const result = sandboxServer(name, current, { backend, args: entry.args, proxyPort: mcpPort, project: fallbackDir(), projectWrite: project(fallbackDir()).settings.mcpProjectWrite, credentialPaths: config.credentialPaths.map(expandHome), homeLinks: config.homeLinks });
           if (!result.ok) {
             log("mcp.skip", { name, reason: result.reason });
             continue;

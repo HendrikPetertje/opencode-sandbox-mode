@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Options, ProjectSettings } from "./options.ts";
 import { projectHash, stateDir } from "./paths.ts";
@@ -31,21 +31,43 @@ function writeJson(path: string, value: unknown): void {
 
 const stringList = (value: unknown): string[] => (Array.isArray(value) ? value.filter((item) => typeof item === "string") : []);
 
-export const projectFile = (directory: string) => join(stateDir(), "projects", `${projectHash(directory)}.json`);
+export const projectFile = (directory: string) => projectFileOf(projectHash(directory));
 export const globalFile = () => join(stateDir(), "global.json");
+export const projectFileOf = (hash: string) => join(stateDir(), "projects", `${hash}.json`);
+export const homeDirOf = (hash: string) => join(stateDir(), "homes", hash);
 /** The sandbox HOME of a project. */
-export const homeDir = (directory: string) => join(stateDir(), "homes", projectHash(directory));
+export const homeDir = (directory: string) => homeDirOf(projectHash(directory));
+
+/** The folders of sandboxed MCP servers for one project: `mcp/<server>/<hash>`. */
+export function mcpDirsOf(hash: string): string[] {
+  try {
+    return readdirSync(join(stateDir(), "mcp"))
+      .map((name) => join(stateDir(), "mcp", name, hash))
+      .filter((path) => existsSync(path));
+  } catch {
+    return [];
+  }
+}
 
 /** Whether the sandbox left anything on disk for this project. */
-export const hasProjectFiles = (directory: string) => existsSync(homeDir(directory)) || existsSync(projectFile(directory));
+export const hasProjectFiles = (directory: string) => {
+  const hash = projectHash(directory);
+  return existsSync(homeDirOf(hash)) || existsSync(projectFileOf(hash)) || mcpDirsOf(hash).length > 0;
+};
 
 /**
- * Deletes what the sandbox made for one project: its home folder and its saved settings and lists. Symlinks in the
- * home (`homeLinks`) are removed, never followed, so their targets stay.
+ * Deletes what the sandbox made for one project: its home folder, the folders of its MCP servers, and its saved
+ * settings and lists. Symlinks in the homes (`homeLinks`) are removed, never followed, so their targets stay.
  */
 export function removeProjectFiles(directory: string): void {
-  rmSync(homeDir(directory), { recursive: true, force: true });
-  rmSync(projectFile(directory), { force: true });
+  removeProjectFilesByHash(projectHash(directory));
+}
+
+/** Same, for a project known only by its hash (its folder may be gone). */
+export function removeProjectFilesByHash(hash: string): void {
+  rmSync(homeDirOf(hash), { recursive: true, force: true });
+  for (const path of mcpDirsOf(hash)) rmSync(path, { recursive: true, force: true });
+  rmSync(projectFileOf(hash), { force: true });
 }
 
 /**

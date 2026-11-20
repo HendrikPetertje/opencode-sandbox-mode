@@ -167,6 +167,8 @@ on closed, it's denied. `websearch` isn't covered. MCP servers aren't either, un
 | Protect hooks | on | `.git/hooks`, `.git/config`, `.opencode` and `.envrc` are read-only |
 | Block credentials | on | `credentialPaths` can't be read or written |
 | Remove sandbox files for this project | | The last row. Greyed out and disabled while the sandbox is on. When it is off, it deletes this project's sandbox home folder and its saved settings and allow/block lists, after a confirmation. See [Cleaning up](#cleaning-up) |
+| List all sandboxes | | The very last row. Opens a list of every sandbox on this machine and lets you wipe the inactive ones. See [All sandboxes](#all-sandboxes) |
+| MCP writes to project | off | Sandboxed MCP servers ([`sandboxMcp`](#mcp-servers)) of this project may write to the project folder and start in it. See [MCP servers](#mcp-servers) |
 | Lock opencode config edits | on | The OpenCode config can't be changed, so a poisoned agent can't weaken or switch off the sandbox. See [Config lock](#config-lock) |
 
 Commands in the sandbox see `OPENCODE_SANDBOX=seatbelt` (or `bubblewrap`).
@@ -175,14 +177,37 @@ Commands in the sandbox see `OPENCODE_SANDBOX=seatbelt` (or `bubblewrap`).
 
 Everything the sandbox makes lives in `~/.local/state/opencode-sandbox-mode/` and **stays after a reboot**: the sandbox
 home of each project (`homes/<hash>/`), its saved settings and lists (`projects/<hash>.json`), the folders of
-sandboxed MCP servers (`mcp/<name>/`), the global lists and the log. While the sandbox is off for a project, the last
+the folders of sandboxed MCP servers for a project (`mcp/<name>/<hash>/`), the global lists and the log. While the sandbox is off for a project, the last
 row of the settings modal, **Remove sandbox files for this project**, deletes that project's home folder and its
 saved settings and lists, after you confirm. (The row is greyed out while the sandbox is on.) The confirmation reminds
 you that the project's allow and block lists go with it: move the entries you want to keep to the global lists first
 (open the project list and press `p`). The project itself is not touched, and neither are the targets of
 `homeLinks` (the symlinks in the home are removed, not followed). The next time you open the modal for the project it
-starts from the defaults again. MCP server folders, the global lists and the log are not per project; delete them
-from the state folder by hand (**Open state folder** opens it).
+starts from the defaults again. The MCP server folders of the project go with it. The global lists and the log are not
+per project; delete them from the state folder by hand (**Open state folder** opens it), as well as the old
+`mcp/<name>/` folders from before the folders were per project.
+
+### All sandboxes
+
+The last row of the settings modal, **List all sandboxes**, opens a list of every sandbox the plugin knows, also those of
+projects you are not in. Each entry shows the project folder, whether the sandbox is on, and how many allow and block
+entries it has:
+
+- **on in this OpenCode** (blue dot) and **on in another OpenCode** (purple dot): in use.
+- **on, but no OpenCode is running it**: the saved flag says on, but nothing is using it (OpenCode was closed or
+  crashed).
+- **off**.
+- **Yellow**: the project folder no longer exists. A **leftover home folder** is a sandbox home whose settings file is
+  gone; it is yellow too.
+
+Sandboxes in use can't be wiped. For the others, `dd` wipes the sandbox after a confirmation: its home folder and its
+saved settings and lists (and its MCP server folders), as with *Remove sandbox files for this project*, but from anywhere, so you can clean up after
+a project was removed. `r` refreshes the list and `h` goes back. If you want to keep white-listed or black-listed
+hosts of a project that still exists, move them to the global lists first.
+
+How "in use" is known: every OpenCode process writes a small heartbeat file (`live/<pid>.json` in the state folder,
+every 20 seconds) with the projects it has the sandbox on for. A project is in use when a fresh heartbeat of a
+running process lists it. The saved on/off flag alone isn't enough: it stays on when OpenCode quits.
 
 ### Config lock
 
@@ -222,9 +247,15 @@ carry `args`, which are added to the command only while it is sandboxed.
 
 - **When:** per project. A project's servers are wrapped while the sandbox is on for that project. Turning it off puts
   the original command back, and the servers restart either way.
-- **Files:** each server gets its own folder under `~/.local/state/opencode-sandbox-mode/mcp/<name>` as `HOME` and
-  working folder. It can only write there and to the temp folders. `homeLinks`, `credentialPaths` and the config lock
-  apply as for shell commands.
+- **Files:** each server gets its own folder per project, `~/.local/state/opencode-sandbox-mode/mcp/<name>/<project hash>`,
+  as `HOME` and working folder. It can write there and to the temp folders. It can read everything except your
+  `credentialPaths`, the project included, by absolute path. `homeLinks`, `credentialPaths` and the config lock apply as
+  for shell commands.
+- **Project access:** the project's **MCP writes to project** setting (a row in the settings modal, off by default,
+  per project) lets the servers of that project write to the project folder, and makes it their working folder, so
+  relative paths work. This is meant for servers that belong to one project, for example ones declared in the
+  project's own `opencode.json`. The project's `.git/hooks`, `.git/config`, `.envrc`, `.opencode` and
+  `opencode.json(c)` stay read-only. Changing the setting restarts the project's servers.
 - **Network:** the servers of a project go through that project's own proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
   and `NODE_USE_ENV_PROXY=1` so Node's own `fetch` uses it too). Direct connections, localhost included, and listening
   on ports are blocked, so a tool that ignores the proxy settings has no network. The network setting and the lists

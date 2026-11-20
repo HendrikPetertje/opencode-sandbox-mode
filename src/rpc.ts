@@ -20,6 +20,8 @@ export const SandboxMode = Rpc.define({
     answer: { input: object, output: object },
     release: { input: object, output: object },
     removeFiles: { input: object, output: object },
+    sandboxes: { input: object, output: object },
+    removeSandbox: { input: object, output: object },
   },
   events: {
     changed: { schema: object },

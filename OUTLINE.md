@@ -33,14 +33,15 @@ user commits and pushes himself (GPG signing), agents never commit.
 | `index.ts` | Server plugin: shared state, sessions and runtimes, the `decide` network pipeline, proxies, RPC handlers, hooks, idle sweep, `sandbox.log`. | everything in `src/` |
 | `tui.tsx` | TUI plugin: `FooterIcon`, `Modal` (settings and list views), `AskPopup`, event listeners, tab-close tracking, keymaps, colours. | `src/rpc.ts`, `src/options.ts` (types), `src/patterns.ts` (`isValid`), `src/paths.ts` (`stateDir`) |
 | `src/options.ts` | `parseOptions` (plugin options -> `Options`; `defaults` are the settings for projects not seen yet), `ProjectSettings`, `SETTING_ROWS` (modal rows incl. list rows `list:<scope>:<kind>` and the action row `openState`), `adjust` (h/l/space), `linkNetwork` (Linux: in follows out), `DEFAULT_CREDENTIALS`, `resolveOptions` (reads the jsonc file named by the `extends` option; its keys win over the inline ones; `stripJsonc`), `lockConfig` (a setting that is never stored), `homeLinks`, `sandboxMcp` entries (`{ name, args }`). | `paths.ts` |
-| `src/state.ts` | `homeDir`, `hasProjectFiles` and `removeProjectFiles` (home + `projects/<hash>.json` for one project; symlinks are removed, not followed). Sync JSON files: `projects/<hash>.json` (`{ directory, settings, lists }`) and `global.json` (`{ allow, deny }`). Atomic writes (tmp + rename). | `paths.ts` |
+| `src/state.ts` | `homeDir`, `mcpDirsOf`, `hasProjectFiles` and `removeProjectFiles` (home + MCP folders + `projects/<hash>.json` for one project; symlinks are removed, not followed). Sync JSON files: `projects/<hash>.json` (`{ directory, settings, lists }`) and `global.json` (`{ allow, deny }`). Atomic writes (tmp + rename). | `paths.ts` |
 | `src/patterns.ts` | Allow/block entries are **regexes on `host:port`**, case-insensitive, compiled once (`compile` cache). `judge`: block wins, then allow, else `ask`. `exact(target)` = escaped `^host:port$` (what the popup saves). | - |
 | `src/proxy.ts` | Forward proxy on `127.0.0.1:<random>` (plus an optional unix socket): HTTP `CONNECT`, plain HTTP with absolute URLs (rewritten to origin form, `Connection: close`), SOCKS5 CONNECT. Calls `decide(target)` per connection before connecting. | - |
 | `src/backend.ts` | `Backend` per OS: `probe()` (does the sandbox start?), `wrap(spec)` (the command string), `supportsAsk`, `linkedNetwork`. `seatbeltProfile` builds the SBPL profile; `bwrapArgs` the bwrap flags. | `bridge.ts`, `paths.ts` |
 | `src/bridge.ts` | Linux ask mode: forwarder source (python3, else node), `findForwarder`, `prepareBridge`, `bridgePrelude` (shell snippet that starts the forwarder, waits for a ready file, then `exec "$0" -c "$1"`). | - |
 | `src/paths.ts` | `stateDir()` (respects `XDG_STATE_HOME`), `projectHash`, `expandHome`, `real` (resolves symlinks of the nearest existing parent; Seatbelt needs `/private/var`, not `/var`), `isInside`, `configDir`, `lockedPaths` (what the config lock protects), `linkIntoHome` (symlinks `homeLinks` into the sandbox home). | - |
 | `src/rpc.ts` | `Rpc.define`: methods `state`, `toggle`, `setSetting`, `listAdd`, `listEdit`, `listRemove`, `listPromote`, `answer`, `release`; events `changed`, `ask`, `failed`, `halted`. Loose `{type:"object"}` schemas. | `@opencode/plugin/rpc` |
-| `src/mcp.ts` | Wraps local MCP servers: `matchesName` (`*` globs), `sandboxServer` (backend `wrapArgv` around the server's argv, HOME and cwd = `state/mcp/<name>`, proxy env incl. `NODE_USE_ENV_PROXY=1`, `args` appended), `proxyEnv` (also used for shell commands). Network is `ask` through the project's proxy, or `closed` without a proxy port. | `backend.ts`, `paths.ts` |
+| `src/sandboxes.ts` | All sandboxes on the machine: per-process heartbeat files (`live/<pid>.json`: pid, time, projects with the sandbox on; `writeLive`, `readLive` drops dead or stale ones), `listSandboxes` (from `projects/*.json` and `homes/*`; `SandboxInfo`: exists, enabled, here/elsewhere/live, counts), `countSandboxes`. Used by the `sandboxes` and `removeSandbox` RPCs and the list view in the modal. | `paths.ts`, `state.ts` |
+| `src/mcp.ts` | Wraps local MCP servers: `matchesName` (`*` globs), `sandboxServer` (backend `wrapArgv` around the server's argv, HOME = `state/mcp/<name>/<project hash>`, cwd = HOME, or the project with `mcpProjectWrite` (then the project is the writable folder, `protectHooks` is on and the lock still covers `.opencode` and `opencode.json(c)`), proxy env incl. `NODE_USE_ENV_PROXY=1`, `args` appended), `proxyEnv` (also used for shell commands). Network is `ask` through the project's proxy, or `closed` without a proxy port. | `backend.ts`, `paths.ts` |
 | `src/sandbox.test.ts` | `bun test`: patterns, options, profiles, proxy (CONNECT, SOCKS5), a live Seatbelt run on macOS. | pure modules |
 
 ## Concepts
@@ -149,7 +150,7 @@ order matters:
   `lockConfig` is forced on at load and by `toggle`, and left out by `saveProject`.
   File tools are denied in a `permission` `evaluate` hook (`FILE_WRITE_ACTIONS`).
 - MCP: `sandboxMcp` names go through `ctx.mcp.transform` (`src/mcp.ts`): `wrapArgv` puts the backend
-  around the server's argv, HOME and cwd are `state/mcp/<name>`. OpenCode runs MCP servers per location and the plugin
+  around the server's argv, HOME is `state/mcp/<name>/<project hash>`; cwd is the project with `mcpProjectWrite`. OpenCode runs MCP servers per location and the plugin
   has one copy per location, so each copy's transform wraps iff the sandbox is on for **its own** project
   (`project(fallbackDir())`); `toggle` calls `reloadMcp`, which reloads every live copy, so servers get the wrapped or
   original command. Fails closed: if the sandbox can't start, the server gets `disabled: true`. Remote servers and
@@ -193,7 +194,8 @@ order matters:
 | Linux bridge (socket + forwarder) | runtime | `…/run/<hash(sessionID)>/`, removed on release |
 | Log (ask, answer, timeout, runtime start/release, errors) | disk | `…/sandbox.log` (append only, not trimmed yet) |
 | Runtimes, asks, session map, running shell calls, tool calls in flight (`calls`), MCP proxies (`mcpProxies`, per project, stable port), failed/checked sessions, live copies | process memory | `globalThis.__opencodeSandboxMode` |
-| Per-MCP-server `HOME` | server | `…/mcp/<name>/` |
+| Per-MCP-server `HOME` | server and project | `…/mcp/<name>/<hash>/` (wiped with the project) |
+| Heartbeat of each OpenCode process | process | `…/live/<pid>.json`, refreshed every 20 s (`shared.heartbeat`), removed on exit; ignored when older than 90 s or the pid is dead |
 
 Never write inside the config dir or a project at runtime: OpenCode watches
 them and reloads plugins in a loop. Everything goes under `stateDir()`.
@@ -313,6 +315,10 @@ Its podman VM clock is skewed: apt needs
 `-o Acquire::Check-Valid-Until=false -o Acquire::Check-Date=false`.
 
 ## Known gaps and ideas
+
+- Old flat `mcp/<name>/` folders (from before they were per project) aren't in the list; delete them by hand.
+- Wiping a sandbox another OpenCode only has cached (off, not live) can be undone: that process writes its cached
+  settings back on its next change. Only live sandboxes are refused.
 
 - `websearch`, remote MCP servers and container-based (podman) MCP servers aren't covered.
 - MCP network on Linux: no bridge for the per-project proxy yet, so wrapped servers get no network. Per-server

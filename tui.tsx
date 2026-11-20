@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { stateDir } from "./src/paths.ts";
 import type { ProjectSettings, SettingRow } from "./src/options.ts";
 import { isValid } from "./src/patterns.ts";
+import type { SandboxInfo } from "./src/sandboxes.ts";
 import { SandboxMode } from "./src/rpc.ts";
 
 interface Lists {
@@ -46,6 +47,7 @@ interface Payload {
   asks: AskInfo[];
   /** The sandbox home of this project and whether the sandbox left any files for it. */
   files?: { home: string; exists: boolean };
+  sandboxCount?: number;
 }
 
 type ListView = { scope: "project" | "global"; kind: "allow" | "deny" };
@@ -272,20 +274,23 @@ export default Plugin.define({
 
     // ------------------------------------------------------------------ modal
 
-    const open = (sessionID: string | undefined, view?: ListView, selected = 0) => {
+    /** `sandboxEntry` opens the list of all sandboxes with that entry selected (`selected` stays the settings row). */
+    const open = (sessionID: string | undefined, view?: ListView, selected = 0, sandboxEntry?: number) => {
       void refresh(sessionID);
-      context.ui.dialog.show(() => <Modal sessionID={sessionID} view={view} selected={selected} />);
+      context.ui.dialog.show(() => <Modal sessionID={sessionID} view={view} selected={selected} sandboxEntry={sandboxEntry} />);
       context.ui.dialog.set({ size: "large", centered: true });
     };
 
-    const Modal = (props: { sessionID: string | undefined; view?: ListView; selected: number }) => {
+    const Modal = (props: { sessionID: string | undefined; view?: ListView; selected: number; sandboxEntry?: number }) => {
       const ctx = usePlugin();
       const dims = useTerminalDimensions();
       const height = () => Math.max(MODAL_MIN, Math.min(26, dims().height - 2 * MODAL_MARGIN - DIALOG_CHROME));
       const state = () => store.states[key(props.sessionID)];
       const [view, setView] = createSignal<ListView | undefined>(props.view);
       const [row, setRow] = createSignal(props.view ? 0 : props.selected);
-      const [entry, setEntry] = createSignal(props.view ? props.selected : 0);
+      const [entry, setEntry] = createSignal(props.view ? props.selected : props.sandboxEntry ?? 0);
+      const [sbx, setSbx] = createSignal<SandboxInfo[] | undefined>(props.sandboxEntry !== undefined ? [] : undefined);
+      const inSandboxes = () => sbx() !== undefined;
       const [help, setHelp] = createSignal(false);
       let scroll: { scrollTo(position: number): void } | undefined;
       let pendingD = 0;
@@ -300,19 +305,37 @@ export default Plugin.define({
         const v = view();
         return v?.scope === "global" ? state()?.lists.config[v.kind] ?? [] : [];
       };
-      const length = () => (view() ? entries().length : state()?.rows.length ?? 0);
+      const length = () => (inSandboxes() ? sbx()!.length : view() ? entries().length : state()?.rows.length ?? 0);
       const move = (delta: number) => {
         const max = Math.max(0, length() - 1);
-        const next = Math.max(0, Math.min(max, (view() ? entry() : row()) + delta));
-        if (view()) setEntry(next);
+        const next = Math.max(0, Math.min(max, (view() || inSandboxes() ? entry() : row()) + delta));
+        if (view() || inSandboxes()) setEntry(next);
         else setRow(next);
-        scroll?.scrollTo(Math.max(0, next - 5));
+        // Sandbox entries are two lines tall.
+        scroll?.scrollTo(Math.max(0, inSandboxes() ? next * 2 - 4 : next - 5));
       };
+      const loadSandboxes = async () => {
+        try {
+          const reply = await rpc().sandboxes({ sessionID: props.sessionID, directory: directory() });
+          setSbx(Array.isArray(reply?.sandboxes) ? reply.sandboxes : []);
+          setEntry((now) => Math.max(0, Math.min(now, (reply?.sandboxes?.length ?? 1) - 1)));
+        } catch (error) {
+          context.ui.toast.show({ variant: "error", title: "Sandbox", message: `Couldn't list the sandboxes: ${(error as Error)?.message ?? error}` });
+        }
+      };
+      if (props.sandboxEntry !== undefined) void loadSandboxes();
       const change = (step: -1 | 1) => {
         const setting = state()?.rows[row()];
         if (!setting) return;
         if (setting.key === "openState") return step === 1 ? openStateFolder() : undefined;
         if (setting.key === "removeFiles") return step === 1 ? void removeFiles() : undefined;
+        if (setting.key === "sandboxes") {
+          if (step !== 1) return;
+          setSbx([]);
+          setEntry(0);
+          scroll?.scrollTo(0);
+          return void loadSandboxes();
+        }
         const list = listKey(setting.key);
         if (list) return step === 1 ? openList(list) : undefined;
         void call("setSetting", props.sessionID, { key: setting.key, step });
@@ -323,10 +346,61 @@ export default Plugin.define({
         scroll?.scrollTo(0);
       };
       const back = () => {
+        if (inSandboxes()) {
+          setSbx(undefined);
+          scroll?.scrollTo(Math.max(0, row() - 5));
+          return;
+        }
         setView(undefined);
         scroll?.scrollTo(Math.max(0, row() - 5));
       };
       const toggle = () => void call("toggle", props.sessionID, {});
+
+      /** Wipes a sandbox from the list: any project, also ones whose folder is gone. The server refuses live ones. */
+      const wipe = async () => {
+        const item = sbx()?.[entry()];
+        if (!item) return;
+        if (item.live) {
+          context.ui.toast.show({
+            variant: "warning",
+            title: "Sandbox",
+            message: item.here ? "The sandbox is on for this project. Turn it off first." : "The sandbox is on in another OpenCode. Turn it off there first.",
+          });
+          return;
+        }
+        const target = item.directory ?? `(unknown project) ${item.hash}`;
+        const confirmed = await context.ui.dialog.confirm({
+          title: "Wipe this sandbox?",
+          message: [
+            target,
+            item.directory && !item.exists ? "The project folder no longer exists." : "",
+            "",
+            `This deletes its sandbox home folder and its saved settings and allow/block lists (${item.allow} allow, ${item.deny} block).`,
+            "",
+            item.exists
+              ? "Cancel first if you want to keep white-listed or black-listed hosts: open that project and move them to the global lists (press p in its list)."
+              : "The white-listed and black-listed hosts of this project are lost with it.",
+            "",
+            "The project itself is not touched. This can't be undone.",
+          ].join("\n"),
+          label: { confirm: "Wipe", cancel: "Cancel" },
+        });
+        let selected = entry();
+        if (confirmed) {
+          try {
+            const reply = await rpc().removeSandbox({ sessionID: props.sessionID, directory: directory(), hash: item.hash });
+            if (Array.isArray(reply?.sandboxes)) selected = Math.min(selected, Math.max(0, reply.sandboxes.length - 1));
+            context.ui.toast.show(
+              reply?.removed
+                ? { variant: "success", title: "Sandbox", message: "Wiped the sandbox." }
+                : { variant: "warning", title: "Sandbox", message: String(reply?.reason ?? "Nothing was removed.") },
+            );
+          } catch (error) {
+            context.ui.toast.show({ variant: "error", title: "Sandbox", message: `Couldn't wipe it: ${(error as Error)?.message ?? error}` });
+          }
+        }
+        open(props.sessionID, undefined, row(), selected);
+      };
 
       const removeFiles = async () => {
         const current = state();
@@ -394,6 +468,7 @@ export default Plugin.define({
         open(props.sessionID, list, index);
       };
       const remove = () => {
+        if (inSandboxes()) return void wipe();
         const list = view();
         if (!list || entries()[entry()] === undefined) return;
         void call("listRemove", props.sessionID, { ...list, index: entry() }).then(() => move(0));
@@ -429,19 +504,20 @@ export default Plugin.define({
           { bind: "shift+g", run: () => move(100000) },
           { bind: "home", run: () => move(-100000) },
           { bind: "end", run: () => move(100000) },
-          { bind: "h", run: () => (view() ? back() : change(-1)) },
-          { bind: "left", run: () => (view() ? back() : change(-1)) },
-          { bind: "l", run: () => (view() ? false : change(1)) },
-          { bind: "right", run: () => (view() ? false : change(1)) },
-          { bind: "space", run: () => (view() ? false : change(1)) },
-          { bind: "return", run: () => (view() ? void edit() : change(1)) },
+          { bind: "h", run: () => (view() || inSandboxes() ? back() : change(-1)) },
+          { bind: "left", run: () => (view() || inSandboxes() ? back() : change(-1)) },
+          { bind: "l", run: () => (view() || inSandboxes() ? false : change(1)) },
+          { bind: "right", run: () => (view() || inSandboxes() ? false : change(1)) },
+          { bind: "space", run: () => (view() || inSandboxes() ? false : change(1)) },
+          { bind: "return", run: () => (view() ? void edit() : inSandboxes() ? false : change(1)) },
           { bind: "e", run: () => (view() ? void edit() : false) },
+          { bind: "r", run: () => (inSandboxes() ? void loadSandboxes() : false) },
           { bind: "a", run: () => (view() ? void add() : false) },
           { bind: "p", run: () => (view() ? promote() : false) },
           {
             bind: "d",
             run: () => {
-              if (!view()) return false;
+              if (!view() && !inSandboxes()) return false;
               const now = Date.now();
               if (now - pendingD < DOUBLE_TAP_MS) {
                 pendingD = 0;
@@ -458,6 +534,7 @@ export default Plugin.define({
       const valueText = (setting: SettingRow) => {
         if (setting.key === "openState") return stateFolderLabel();
         if (setting.key === "removeFiles") return on() ? "disabled" : state()?.files?.exists ? "›" : "nothing to remove";
+        if (setting.key === "sandboxes") return `${state()?.sandboxCount ?? 0} ›`;
         const list = listKey(setting.key);
         if (list) {
           const count = state()?.lists[list.scope][list.kind].length ?? 0;
@@ -473,7 +550,7 @@ export default Plugin.define({
       };
       const valueColor = (setting: SettingRow) => {
         if (setting.key === "removeFiles") return !on() && state()?.files?.exists ? COLOR.love : COLOR.muted;
-        if (setting.key === "openState" || listKey(setting.key)) return COLOR.iris;
+        if (setting.key === "openState" || setting.key === "sandboxes" || listKey(setting.key)) return COLOR.iris;
         if (setting.key === "localhost" && linked()) return COLOR.muted;
         const value = state()?.settings[setting.key as keyof ProjectSettings];
         if (typeof value === "boolean") return value ? COLOR.foam : COLOR.muted;
@@ -501,12 +578,12 @@ export default Plugin.define({
               }}
             >
               <text
-                fg={(setting.key === "removeFiles" ? (on() ? COLOR.muted : COLOR.love) : listKey(setting.key) || setting.key === "openState" ? COLOR.iris : ctx.theme.text.base) as any}
+                fg={(setting.key === "removeFiles" ? (on() ? COLOR.muted : COLOR.love) : listKey(setting.key) || setting.key === "openState" || setting.key === "sandboxes" ? COLOR.iris : ctx.theme.text.base) as any}
                 width={labelWidth()}
               >
                 {setting.label}
               </text>
-              <text fg={(on() || setting.key === "removeFiles" ? valueColor(setting) : COLOR.muted) as any} attributes={TextAttributes.BOLD}>
+              <text fg={(on() || setting.key === "removeFiles" || setting.key === "sandboxes" ? valueColor(setting) : COLOR.muted) as any} attributes={TextAttributes.BOLD}>
                 {valueText(setting)}
               </text>
             </box>
@@ -552,7 +629,49 @@ export default Plugin.define({
         </scrollbox>
       );
 
+      const statusOf = (item: SandboxInfo) => {
+        const state = item.here ? "on in this OpenCode" : item.elsewhere ? "on in another OpenCode" : item.enabled ? "on, but no OpenCode is running it" : "off";
+        const parts = [state];
+        if (item.directory && !item.exists) parts.push("project folder is gone");
+        if (!item.directory) parts.push("only a leftover home folder");
+        if (item.current) parts.push("this project");
+        parts.push(`${item.allow} allow, ${item.deny} block`);
+        return parts.join(" · ");
+      };
+      const Sandboxes = () => (
+        <scrollbox ref={(el: any) => (scroll = el)} flexGrow={1} flexBasis={0} minHeight={0}>
+          {(sbx() ?? []).map((item, index) => (
+            <box
+              flexDirection="column"
+              flexShrink={0}
+              backgroundColor={index === entry() ? (COLOR.surface as any) : undefined}
+              onMouseUp={() => setEntry(index)}
+            >
+              <box flexDirection="row" gap={1}>
+                <text fg={(item.here ? COLOR.foam : item.elsewhere ? COLOR.iris : COLOR.muted) as any}>●</text>
+                <text fg={(!item.directory || !item.exists ? COLOR.gold : ctx.theme.text.base) as any}>
+                  {item.directory ?? `(unknown project) ${item.hash}`}
+                </text>
+              </box>
+              <text fg={COLOR.muted as any}>{`  ${statusOf(item)}`}</text>
+            </box>
+          ))}
+          {(sbx() ?? []).length === 0 && <text fg={COLOR.muted as any}>No sandboxes yet.</text>}
+          <box height={1} flexShrink={0} />
+          <text fg={COLOR.muted as any} wrapMode="word">
+            {(() => {
+              const item = sbx()?.[entry()];
+              if (!item) return "";
+              if (item.live) return "In use. Turn its sandbox off (in that OpenCode) before wiping it.";
+              return "Press dd to wipe it: deletes its sandbox home folder and its saved settings and allow/block lists. The project itself is not touched.";
+            })()}
+          </text>
+          <text fg={COLOR.muted as any}>Yellow: the project folder no longer exists.</text>
+        </scrollbox>
+      );
+
       const hint = () => {
+        if (inSandboxes()) return help() ? "j/k move · gg/G top/bottom · dd wipe an inactive sandbox · r refresh · h back · esc close" : "j/k · dd wipe · r refresh · h back · ? help";
         if (help()) {
           return view()
             ? "j/k move · gg/G top/bottom · e/enter edit · a add · dd remove · p promote to global (project lists) · h back · esc close"
@@ -565,12 +684,12 @@ export default Plugin.define({
         <box flexDirection="column" paddingLeft={2} paddingRight={2} height={height()}>
           <box flexDirection="row" flexShrink={0} gap={1}>
             <text fg={(state()?.failed ? COLOR.love : on() ? COLOR.foam : COLOR.muted) as any} attributes={TextAttributes.BOLD}>
-              {`${on() ? ICON.cube : ICON.cubeOff} Sandbox${view() ? ` · ${listTitle(view()!)}` : ""}`}
+              {`${on() ? ICON.cube : ICON.cubeOff} Sandbox${view() ? ` · ${listTitle(view()!)}` : inSandboxes() ? " · All sandboxes" : ""}`}
             </text>
             <text fg={COLOR.muted as any}>{state()?.directory ?? ""}</text>
           </box>
           <box height={1} flexShrink={0} border={["top"]} borderColor={COLOR.muted as any} />
-          {view() ? <List /> : <Settings />}
+          {view() ? <List /> : inSandboxes() ? <Sandboxes /> : <Settings />}
           <box height={1} flexShrink={0} border={["top"]} borderColor={COLOR.muted as any} marginTop={1} />
           <box flexDirection="row" flexShrink={0} justifyContent="space-between">
             <text fg={COLOR.muted as any} wrapMode="word" flexShrink={1}>{hint()}</text>
