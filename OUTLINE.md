@@ -31,15 +31,15 @@ user commits and pushes himself (GPG signing), agents never commit.
 | File | Role | Imports from |
 |---|---|---|
 | `index.ts` | Server plugin: shared state, sessions and runtimes, the `decide` network pipeline, proxies, RPC handlers, hooks, idle sweep, `sandbox.log`. | everything in `src/` |
-| `tui.tsx` | TUI plugin: `FooterIcon`, `Modal` (settings and list views), `AskPopup`, event listeners, tab-close tracking, keymaps, colours. | `src/rpc.ts`, `src/options.ts` (types), `src/patterns.ts` (`isValid`), `src/paths.ts` (`stateDir`) |
-| `src/options.ts` | `parseOptions` (plugin options -> `Options`; `defaults` are the settings for projects not seen yet), `ProjectSettings`, `SETTING_ROWS` (modal rows incl. list rows `list:<scope>:<kind>` and the action row `openState`), `adjust` (h/l/space), `linkNetwork` (Linux: in follows out), `DEFAULT_CREDENTIALS`, `resolveOptions` (reads the jsonc file named by the `extends` option; its keys win over the inline ones; `stripJsonc`), `lockConfig` (a setting that is never stored), `homeLinks`, `sandboxMcp` entries (`{ name, args }`). | `paths.ts` |
+| `tui.tsx` | TUI plugin: `FooterIcon`, `Modal` (settings, list and all-sandboxes views), `AskPopup`, event listeners, tab-close tracking, keymaps, colours. | `src/rpc.ts`, `src/options.ts` (types), `src/patterns.ts` (`isValid`), `src/paths.ts` (`stateDir`), `src/sandboxes.ts` (type `SandboxInfo`) |
+| `src/options.ts` | `parseOptions` (plugin options -> `Options`; `defaults` are the settings for projects not seen yet), `ProjectSettings`, `SETTING_ROWS` (modal rows incl. list rows `list:<scope>:<kind>` and the action row `openState`), `adjust` (h/l/space), `linkNetwork` (Linux: in follows out), `DEFAULT_CREDENTIALS`, `resolveOptions` (reads the jsonc file named by the `extends` option; its keys win over the inline ones; `stripJsonc`), `lockConfig` (a setting that is never stored), `mcpProjectWrite`, `fillSettings` (defaults for keys a cached older state lacks), `homeLinks`, `sandboxMcp` entries (`{ name, args }`). | `paths.ts` |
 | `src/state.ts` | `homeDir`, `mcpDirsOf`, `hasProjectFiles` and `removeProjectFiles` (home + MCP folders + `projects/<hash>.json` for one project; symlinks are removed, not followed). Sync JSON files: `projects/<hash>.json` (`{ directory, settings, lists }`) and `global.json` (`{ allow, deny }`). Atomic writes (tmp + rename). | `paths.ts` |
 | `src/patterns.ts` | Allow/block entries are **regexes on `host:port`**, case-insensitive, compiled once (`compile` cache). `judge`: block wins, then allow, else `ask`. `exact(target)` = escaped `^host:port$` (what the popup saves). | - |
 | `src/proxy.ts` | Forward proxy on `127.0.0.1:<random>` (plus an optional unix socket): HTTP `CONNECT`, plain HTTP with absolute URLs (rewritten to origin form, `Connection: close`), SOCKS5 CONNECT. Calls `decide(target)` per connection before connecting. | - |
 | `src/backend.ts` | `Backend` per OS: `probe()` (does the sandbox start?), `wrap(spec)` (the command string), `supportsAsk`, `linkedNetwork`. `seatbeltProfile` builds the SBPL profile; `bwrapArgs` the bwrap flags. | `bridge.ts`, `paths.ts` |
 | `src/bridge.ts` | Linux ask mode: forwarder source (python3, else node), `findForwarder`, `prepareBridge`, `bridgePrelude` (shell snippet that starts the forwarder, waits for a ready file, then `exec "$0" -c "$1"`). | - |
 | `src/paths.ts` | `stateDir()` (respects `XDG_STATE_HOME`), `projectHash`, `expandHome`, `real` (resolves symlinks of the nearest existing parent; Seatbelt needs `/private/var`, not `/var`), `isInside`, `configDir`, `lockedPaths` (what the config lock protects), `linkIntoHome` (symlinks `homeLinks` into the sandbox home). | - |
-| `src/rpc.ts` | `Rpc.define`: methods `state`, `toggle`, `setSetting`, `listAdd`, `listEdit`, `listRemove`, `listPromote`, `answer`, `release`; events `changed`, `ask`, `failed`, `halted`. Loose `{type:"object"}` schemas. | `@opencode/plugin/rpc` |
+| `src/rpc.ts` | `Rpc.define`: methods `state`, `toggle`, `setSetting`, `listAdd`, `listEdit`, `listRemove`, `listPromote`, `answer`, `release`, `removeFiles` (this project), `sandboxes` (list all), `removeSandbox` (by hash; refuses live ones); events `changed`, `ask`, `failed`, `halted`. Loose `{type:"object"}` schemas. | `@opencode/plugin/rpc` |
 | `src/sandboxes.ts` | All sandboxes on the machine: per-process heartbeat files (`live/<pid>.json`: pid, time, projects with the sandbox on; `writeLive`, `readLive` drops dead or stale ones), `listSandboxes` (from `projects/*.json` and `homes/*`; `SandboxInfo`: exists, enabled, here/elsewhere/live, counts), `countSandboxes`. Used by the `sandboxes` and `removeSandbox` RPCs and the list view in the modal. | `paths.ts`, `state.ts` |
 | `src/mcp.ts` | Wraps local MCP servers: `matchesName` (`*` globs), `sandboxServer` (backend `wrapArgv` around the server's argv, HOME = `state/mcp/<name>/<project hash>`, cwd = HOME, or the project with `mcpProjectWrite` (then the project is the writable folder, `protectHooks` is on and the lock still covers `.opencode` and `opencode.json(c)`), proxy env incl. `NODE_USE_ENV_PROXY=1`, `args` appended), `proxyEnv` (also used for shell commands). Network is `ask` through the project's proxy, or `closed` without a proxy port. | `backend.ts`, `paths.ts` |
 | `src/sandbox.test.ts` | `bun test`: patterns, options, profiles, proxy (CONNECT, SOCKS5), a live Seatbelt run on macOS. | pure modules |
@@ -218,7 +218,9 @@ different copy, and old copies stay alive until disposed.
   objects (and old `asks`) across reloads.
 - Every setup resets `lockConfig` to on for the projects already cached on `shared` (a hot reload keeps them), so the
   lock is back on after any plugin reload, also when the user just turned it off. A stale cached state once had no
-  `lockConfig` at all (read as off).
+  `lockConfig` at all (read as off). The same setup also runs `fillSettings`, and `project()` does it for any cached
+  state with fewer keys than the defaults, so a setting added in a later version is its default, never `undefined`
+  (the modal printed "undefined" and `adjust` treated it as an enum once).
 - A copy only reloads the MCP servers of its own location: reloading after a toggle has to go through every entry in
   `shared.copies` (`reloadMcp`).
 
@@ -227,7 +229,7 @@ different copy, and old copies stay alive until disposed.
 - `state({ sessionID?, directory? })` returns everything the TUI renders:
   directory, `rootID`, settings, rows, lists (`project`, `global`, `config`),
   keybind, `failed`, `problem`, `backend`, `askSupported`, `linkedNetwork`,
-  and the session's open asks.
+  `files` (this project's home and whether anything is left on disk), `sandboxCount`, and the session's open asks.
 - **RPC replies and event payloads must be plain JSON.** A field set to
   `undefined` fails the whole call with `rpc.invalid_output` (HTTP 500), and the
   TUI then silently does nothing (this broke the power button once). Every
@@ -271,6 +273,12 @@ different copy, and old copies stay alive until disposed.
   edit, `a` add, `dd` delete, `p` promote a project entry to global, `-`
   power, `?` long help. Arrow keys, `Home`, `End` work too but are **not
   shown in the legend** (the user's wish). No number shortcuts (more than 9 rows).
+- The modal's dialog size follows the terminal: `xlarge` from `WIDE_MODAL_MIN_COLUMNS` (124) columns, else `large`,
+  set in an effect on `useTerminalDimensions` inside `Modal` (so also on resize). `open()` doesn't set a size.
+- Last rows: `removeFiles` (grey, "disabled", while the sandbox is on; `dialog.confirm`, then the modal is reopened) and
+  `sandboxes` ("N entries ›"; opens a third view in the same component: `sbx` signal, `loadSandboxes`, keys `dd` wipe
+  via confirm and `r` refresh, `h` back). The yellow legend lives in that view, not in the row description. After a
+  confirm the modal reopens through `open(sessionID, undefined, row, sandboxEntry)`.
 - Add/edit uses `context.ui.dialog.prompt`, which replaces the modal; the
   modal is reopened afterwards in the same list and position.
 - `openState` row opens `stateDir()` in Finder (`open`) / `xdg-open`, like

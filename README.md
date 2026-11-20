@@ -71,6 +71,8 @@ whatever you last picked in the TUI.
 | `?` | all shortcuts |
 | `esc` | close |
 
+The modal uses a wider dialog when the terminal is at least 124 columns wide.
+
 ### Allow and block lists
 
 There are four lists: project allow, project block, global allow and global
