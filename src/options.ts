@@ -1,3 +1,7 @@
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { configDir, expandHome } from "./paths.ts";
+
 export const NETWORK_OUT = ["open", "ask", "closed"] as const;
 export const NETWORK_IN = ["open", "closed"] as const;
 export type NetworkOut = (typeof NETWORK_OUT)[number];
@@ -13,6 +17,8 @@ export interface ProjectSettings {
   syntheticHome: boolean;
   protectHooks: boolean;
   blockCredentials: boolean;
+  /** Keeps the OpenCode config read-only. Never stored: it is on again every time the sandbox is turned on. */
+  lockConfig: boolean;
 }
 
 export interface Options {
@@ -21,8 +27,8 @@ export interface Options {
   askTimeoutSeconds: number;
   failDelaySeconds: number;
   credentialPaths: string[];
-  extraReadPaths: string[];
-  extraWritePaths: string[];
+  /** Paths in your real home that are symlinked into the sandbox home (same relative path), e.g. `~/.config/containers`. */
+  homeLinks: string[];
   allow: string[];
   deny: string[];
 }
@@ -52,6 +58,49 @@ const seconds = (value: unknown, fallback: number) => {
   return Number.isFinite(number) && number >= 0 ? number : fallback;
 };
 
+/** Strips comments and trailing commas, so a `.jsonc` file can go through JSON.parse. Strings are left alone. */
+export function stripJsonc(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]!;
+    if (char === '"') {
+      let end = i + 1;
+      while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
+      out += text.slice(i, end + 1);
+      i = end;
+    } else if (char === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (char === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      i = end === -1 ? text.length : end + 1;
+    } else {
+      out += char;
+    }
+  }
+  return out.replace(/,(\s*[\]}])/g, "$1");
+}
+
+/**
+ * Options from opencode.jsonc, extended by the file named in `extends` (jsonc). Keys in that file win over the
+ * inline ones. A missing file is fine (it's meant to be git-ignored); an unreadable one is reported in `warning`.
+ */
+export function resolveOptions(raw: Record<string, unknown> | undefined): { options: Options; warning?: string } {
+  const inline = raw ?? {};
+  const source = typeof inline.extends === "string" ? inline.extends.trim() : "";
+  if (!source) return { options: parseOptions(inline) };
+  const path = source.startsWith("~") ? expandHome(source) : resolve(configDir(), source);
+  if (!existsSync(path)) return { options: parseOptions(inline) };
+  try {
+    const extra = JSON.parse(stripJsonc(readFileSync(path, "utf8")));
+    if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new Error("expected an object");
+    const { extends: _ignored, ...rest } = extra as Record<string, unknown>;
+    return { options: parseOptions({ ...inline, ...rest }) };
+  } catch (error) {
+    return { options: parseOptions(inline), warning: `${path}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 export function parseOptions(raw: Record<string, unknown> | undefined): Options {
   const options = raw ?? {};
   return {
@@ -64,13 +113,13 @@ export function parseOptions(raw: Record<string, unknown> | undefined): Options 
       syntheticHome: bool(options.syntheticHome, true),
       protectHooks: bool(options.protectHooks, true),
       blockCredentials: bool(options.blockCredentials, true),
+      lockConfig: true,
     },
     keybind: typeof options.keybind === "string" && options.keybind.trim() ? options.keybind.trim() : "<leader>o",
     askTimeoutSeconds: seconds(options.askTimeoutSeconds, 20),
     failDelaySeconds: seconds(options.failDelaySeconds, 4),
     credentialPaths: strings(options.credentialPaths) ?? DEFAULT_CREDENTIALS,
-    extraReadPaths: strings(options.extraReadPaths) ?? [],
-    extraWritePaths: strings(options.extraWritePaths) ?? [],
+    homeLinks: strings(options.homeLinks) ?? [],
     allow: strings(options.allow) ?? [],
     deny: strings(options.deny) ?? [],
   };
@@ -88,10 +137,16 @@ export const SETTING_ROWS: SettingRow[] = [
   { key: "networkOut", label: "Network out", description: "open: everything · ask: a popup for each new host · closed: nothing, lists ignored" },
   { key: "networkIn", label: "Network in", description: "open: commands may listen on ports · closed: listening is blocked" },
   { key: "localhost", label: "Localhost", description: "With network out on ask or closed: still allow connections to this machine (dev servers, databases)" },
-  { key: "projectOnlyWrites", label: "Project-only writes", description: "Writes only inside the project, temp folders and the sandbox home (plus extraWritePaths)" },
+  { key: "projectOnlyWrites", label: "Project-only writes", description: "Writes only inside the project and temp folders and the sandbox home" },
   { key: "syntheticHome", label: "Sandbox home", description: "HOME points at an empty per-project folder, so tools don't read or write your real dotfiles" },
   { key: "protectHooks", label: "Protect hooks", description: ".git/hooks, .git/config, .opencode and .envrc are read-only" },
   { key: "blockCredentials", label: "Block credentials", description: "credentialPaths (from opencode.jsonc) can't be read or written" },
+  {
+    key: "lockConfig",
+    label: "Lock opencode config edits",
+    description:
+      "OpenCode config, this plugin's state and homeLinks targets can't be changed: file tools are denied and shell writes blocked. Switches back on every time the sandbox is turned on",
+  },
   { key: "list:project:allow", label: "Project allowlist", description: "Regexes on host:port this project may connect to" },
   { key: "list:project:deny", label: "Project blocklist", description: "Regexes on host:port this project may never connect to" },
   { key: "list:global:allow", label: "Global allowlist", description: "Allowed in every project" },

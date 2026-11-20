@@ -161,12 +161,33 @@ on closed, it's denied. MCP servers and `websearch` aren't covered.
 | Network out | `ask` | `open`: no limits. `ask`: only the plugin's proxy is reachable, and it asks per host. `closed`: no network, lists are ignored |
 | Network in | `closed` | Commands can't listen on ports |
 | Localhost | on | With network out on ask or closed, connections to this machine (dev servers, databases) still work (macOS only) |
-| Project-only writes | on | Writes only inside the project, the temp folders, the sandbox home and `extraWritePaths` |
+| Project-only writes | on | Writes only inside the project, the temp folders and the sandbox home |
 | Sandbox home | on | `HOME` is an empty per-project folder under `~/.local/state/opencode-sandbox-mode/homes/` |
 | Protect hooks | on | `.git/hooks`, `.git/config`, `.opencode` and `.envrc` are read-only |
 | Block credentials | on | `credentialPaths` can't be read or written |
+| Lock opencode config edits | on | The OpenCode config can't be changed, so a poisoned agent can't weaken or switch off the sandbox. See [Config lock](#config-lock) |
 
 Commands in the sandbox see `OPENCODE_SANDBOX=seatbelt` (or `bubblewrap`).
+
+### Config lock
+
+With **Lock opencode config edits** on, these are read-only for the agent:
+
+- the OpenCode config folder (`~/.config/opencode`, or `$OPENCODE_CONFIG_DIR`), also when it is the project
+- this plugin's state folder (it holds the on/off flag)
+- the project's `opencode.json`, `opencode.jsonc` and `.opencode`
+- the targets of `homeLinks`
+
+Shell commands are blocked by the OS sandbox itself (a deny rule placed after
+the project-write allow, so it holds inside the project and through `homeLinks`
+symlinks; `--ro-bind` on Linux). OpenCode's `edit`, `write` and patch tools run
+outside the sandbox, so the plugin denies them through the permission check.
+The sandbox home inside the state folder stays writable.
+
+The lock is never stored. It is on whenever the sandbox is turned on and after
+every OpenCode start; switching it off in the settings modal is a deliberate
+step each time. Add `service.json` (the server password, which can drive the
+plugin's RPC) to `credentialPaths` so a shell command can't read it.
 
 ### Linux
 
@@ -238,8 +259,8 @@ A new session checks again.
 | `protectHooks` | `true` | |
 | `blockCredentials` | `true` | |
 | `credentialPaths` | `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.gnupg`, `~/.docker/config.json`, `~/.kube`, `~/.netrc`, `~/.npmrc`, `~/.git-credentials`, `~/.local/share/opencode/auth.json` | Replaces the default list, so repeat the defaults you want to keep |
-| `extraReadPaths` | `[]` | Readable even if inside a credential path |
-| `extraWritePaths` | `[]` | Writable with project-only writes on |
+| `homeLinks` | `[]` | Paths in your real home (`~/...`) that are symlinked into the sandbox home at the same relative path, so tools still find their config there (e.g. `~/.npmrc`). Skipped if the path is missing, outside your home, or inside a credential path. |
+| `extends` | none | Path to a `.jsonc` file with more options. Relative paths are relative to the OpenCode config folder, `~` works. Keys in that file override the inline ones, and a missing file is ignored, so it can be git-ignored. A broken file is logged in `sandbox.log` |
 | `allow` | `[]` | Global allowlist entries (regexes) |
 | `deny` | `[]` | Global blocklist entries (regexes) |
 | `askTimeoutSeconds` | `20` | How long the ask popup waits |
@@ -257,7 +278,8 @@ A new session checks again.
   Claude Code use. Some tools (browsers, podman) need extra paths or don't
   work in it.
 - **Sandbox home:** git and other tools won't see your real dotfiles. Git
-  needs `user.name`/`user.email` in the repo, or turn the setting off.
+  needs `user.name`/`user.email` in the repo, turn the setting off, or share
+  specific paths with `homeLinks`.
 - **Without sandbox home**, `zsh -c` still reads `~/.zshenv`. If that file
   is inside a credential path, every command prints a permission error.
 - **Only the agent's shell commands are sandboxed.** Your own `!` commands

@@ -42,12 +42,16 @@ export function loadProject(directory: string, options: Options): ProjectState {
   const stored = readJson(projectFile(directory));
   return {
     directory,
-    settings: { ...options.defaults, ...(stored?.settings ?? {}) },
+    settings: { ...options.defaults, ...(stored?.settings ?? {}), lockConfig: true },
     lists: { allow: stringList(stored?.lists?.allow), deny: stringList(stored?.lists?.deny) },
   };
 }
 
-export const saveProject = (state: ProjectState) => writeJson(projectFile(state.directory), state);
+/** `lockConfig` is left out on purpose: it has to be switched off by hand after every start and every sandbox on. */
+export const saveProject = (state: ProjectState) => {
+  const { lockConfig: _lock, ...settings } = state.settings;
+  writeJson(projectFile(state.directory), { ...state, settings });
+};
 
 export function loadGlobal(): Lists {
   const stored = readJson(globalFile());

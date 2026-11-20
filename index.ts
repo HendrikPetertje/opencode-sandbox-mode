@@ -7,11 +7,11 @@
 import { Plugin } from "@opencode/plugin";
 import { appendFileSync, mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { backendFor, type Backend, type Spec } from "./src/backend.ts";
 import { BRIDGE_SOCKET, findForwarder, prepareBridge } from "./src/bridge.ts";
-import { adjust, linkNetwork, parseOptions, SETTING_ROWS, type Options, type SettingKey } from "./src/options.ts";
-import { expandHome, isInside, projectHash, stateDir } from "./src/paths.ts";
+import { adjust, linkNetwork, resolveOptions, SETTING_ROWS, type Options, type SettingKey } from "./src/options.ts";
+import { expandHome, isInside, linkIntoHome, lockedPaths, projectHash, real, stateDir } from "./src/paths.ts";
 import { exact, isValid, judge } from "./src/patterns.ts";
 import { startProxy, type Proxy } from "./src/proxy.ts";
 import { SandboxMode } from "./src/rpc.ts";
@@ -27,6 +27,8 @@ const SWEEP_EVERY_MS = 10 * 60_000;
 const IDLE_RELEASE_MS = 2 * 60 * 60_000;
 type Choice = "allow" | "whitelist" | "reject" | "blacklist";
 const CHOICES: Choice[] = ["allow", "whitelist", "reject", "blacklist"];
+/** Permission actions of OpenCode's file-changing tools. */
+const FILE_WRITE_ACTIONS = new Set(["edit", "write", "patch", "apply_patch", "multiedit"]);
 
 interface Ask {
   id: string;
@@ -110,7 +112,8 @@ function log(event: string, data: Record<string, unknown>): void {
 export default Plugin.define({
   id: "sandbox-mode",
   async setup(ctx) {
-    const options = parseOptions(ctx.options as Record<string, unknown>);
+    const { options, warning } = resolveOptions(ctx.options as Record<string, unknown>);
+    if (warning) log("error", { where: "extends", error: warning });
     // All mutable state lives on globalThis: hooks, the TUI's RPC calls and the proxies can each land in a different copy.
     const shared = ((globalThis as any).__opencodeSandboxMode ??= {}) as Shared;
     shared.projects ??= new Map();
@@ -122,6 +125,8 @@ export default Plugin.define({
     shared.failed ??= new Set();
     shared.copies ??= [];
     shared.options = options;
+    // Projects cached by an earlier copy (a hot reload keeps them) start locked again, like after a restart.
+    for (const state of shared.projects.values()) state.settings = { ...state.settings, lockConfig: true };
     shared.backend = backendFor(process.platform);
     const latest = () => shared.copies.at(-1);
     const emit = (event: string, payload: Record<string, unknown>) => latest()?.emit(event, payload);
@@ -144,6 +149,10 @@ export default Plugin.define({
       }
     };
     shared.isSandboxed = (directory) => (directory ? project(directory).settings.enabled : false);
+    const locked = (directory: string): string[] => {
+      const { settings } = project(directory);
+      return settings.enabled && settings.lockConfig !== false ? lockedPaths(directory, (shared.options ?? options).homeLinks) : [];
+    };
 
     const probe = (): string | undefined => {
       shared.probed = true;
@@ -380,7 +389,8 @@ export default Plugin.define({
       state: async (input: any) => statePayload(input ?? {}),
       toggle: async (input: any) => {
         const state = await projectOf(input);
-        state.settings = { ...state.settings, enabled: !state.settings.enabled };
+        // Turning the sandbox on always switches the config lock back on.
+        state.settings = { ...state.settings, enabled: !state.settings.enabled, lockConfig: true };
         save(state);
         emit("changed", {});
         return statePayload(input ?? {});
@@ -530,6 +540,7 @@ export default Plugin.define({
         const home = settings.syntheticHome ? join(stateDir(), "homes", projectHash(owner.directory)) : undefined;
         if (home) {
           mkdirSync(home, { recursive: true });
+          linkIntoHome(home, config.homeLinks, config.credentialPaths.map(expandHome));
           event.env.HOME = home;
         }
         const spec: Spec = {
@@ -540,8 +551,7 @@ export default Plugin.define({
           settings,
           home,
           credentialPaths: config.credentialPaths.map(expandHome),
-          extraReadPaths: config.extraReadPaths.map(expandHome),
-          extraWritePaths: config.extraWritePaths.map(expandHome),
+          lockedPaths: locked(owner.directory),
         };
         // Without a session (your own commands) there's nobody to ask: ask mode acts as closed.
         if (settings.networkOut === "ask" && shared.backend.supportsAsk && owner.sessionID) {
@@ -567,8 +577,30 @@ export default Plugin.define({
       }
     });
 
-    // webfetch runs in OpenCode itself, outside the sandbox: send its host through the same lists and popup.
+    // OpenCode's file tools run outside the sandbox, so the config lock has to refuse them here.
     const permission = await ctx.permission.hook("evaluate", async (event: any) => {
+      if (!FILE_WRITE_ACTIONS.has(event.action) || event.effect === "deny") return;
+      try {
+        const { directory } = await sessionInfo(event.sessionID);
+        const paths = directory ? locked(directory) : [];
+        if (!directory || paths.length === 0) return;
+        const candidates = [...(event.resources ?? []), ...Object.values(event.metadata ?? {}).filter((value) => typeof value === "string")];
+        const hit = candidates.find((candidate: string) => {
+          if (typeof candidate !== "string" || candidate === "*") return false;
+          const path = real(candidate.startsWith("~") ? expandHome(candidate) : resolve(directory, candidate));
+          return paths.some((locked) => isInside(path, locked));
+        });
+        if (!hit) return;
+        event.effect = "deny";
+        event.message = `sandbox-mode: ${hit} is part of the OpenCode config, which the sandbox keeps read-only (turn off "Lock opencode config edits" in the sandbox settings to allow it)`;
+        log("lock.deny", { sessionID: event.sessionID, action: event.action, path: hit });
+      } catch (error) {
+        logError("config lock check", error);
+      }
+    });
+
+    // webfetch runs in OpenCode itself, outside the sandbox: send its host through the same lists and popup.
+    const webfetchPermission = await ctx.permission.hook("evaluate", async (event: any) => {
       if (event.action !== "webfetch" || event.effect === "deny") return;
       try {
         const { directory, rootID } = await sessionInfo(event.sessionID);
@@ -597,7 +629,7 @@ export default Plugin.define({
 
     return async () => {
       shared.copies = shared.copies.filter((entry) => entry !== copy);
-      await Promise.allSettled([before.dispose(), after.dispose(), shellHook.dispose(), permission.dispose(), registration.dispose()]);
+      await Promise.allSettled([before.dispose(), after.dispose(), shellHook.dispose(), permission.dispose(), webfetchPermission.dispose(), registration.dispose()]);
     };
   },
 });

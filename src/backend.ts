@@ -18,8 +18,8 @@ export interface Spec {
   /** The synthetic home, when that setting is on. */
   home?: string;
   credentialPaths: string[];
-  extraReadPaths: string[];
-  extraWritePaths: string[];
+  /** Read-only for the shell, also under writable folders. Empty when the config lock is off. */
+  lockedPaths: string[];
 }
 
 export interface Backend {
@@ -49,7 +49,7 @@ export function seatbeltProfile(spec: Spec): string {
   const project = real(spec.project);
 
   if (settings.projectOnlyWrites) {
-    const writable = [project, "/private/tmp", "/private/var/folders", ...spec.extraWritePaths.map(real)];
+    const writable = [project, "/private/tmp", "/private/var/folders"];
     if (spec.home) writable.push(real(spec.home));
     lines.push("(deny file-write*)");
     lines.push(`(allow file-write* ${writable.map((path) => `(subpath ${sb(path)})`).join(" ")} (regex #"^/dev/"))`);
@@ -57,11 +57,13 @@ export function seatbeltProfile(spec: Spec): string {
   if (settings.protectHooks) {
     lines.push(`(deny file-write* ${protectedPaths(project).map(({ path }) => `(subpath ${sb(path)})`).join(" ")})`);
   }
+  if (spec.lockedPaths.length > 0) {
+    lines.push(`(deny file-write* ${spec.lockedPaths.map((path) => `(subpath ${sb(real(path))})`).join(" ")})`);
+    // The sandbox home lives inside the locked plugin state folder.
+    if (spec.home) lines.push(`(allow file-write* (subpath ${sb(real(spec.home))}))`);
+  }
   if (settings.blockCredentials && spec.credentialPaths.length > 0) {
     lines.push(`(deny file-read* file-write* ${spec.credentialPaths.map((path) => `(subpath ${sb(real(path))})`).join(" ")})`);
-  }
-  if (spec.extraReadPaths.length > 0) {
-    lines.push(`(allow file-read* ${spec.extraReadPaths.map((path) => `(subpath ${sb(real(path))})`).join(" ")})`);
   }
 
   if (settings.networkOut !== "open") {
@@ -108,7 +110,6 @@ export function bwrapArgs(spec: Spec): string[] {
   if (settings.projectOnlyWrites) {
     args.push("--ro-bind", "/", "/", "--tmpfs", "/tmp", "--bind", spec.project, spec.project);
     if (spec.home) args.push("--bind", spec.home, spec.home);
-    for (const path of spec.extraWritePaths) if (existsSync(path)) args.push("--bind", path, path);
   } else {
     args.push("--bind", "/", "/");
   }
@@ -116,6 +117,8 @@ export function bwrapArgs(spec: Spec): string[] {
   if (settings.protectHooks) {
     for (const { path } of protectedPaths(spec.project)) if (existsSync(path)) args.push("--ro-bind", path, path);
   }
+  for (const path of spec.lockedPaths) if (existsSync(path)) args.push("--ro-bind", path, path);
+  if (spec.home && spec.lockedPaths.length > 0) args.push("--bind", spec.home, spec.home);
   if (settings.blockCredentials) {
     for (const path of spec.credentialPaths) {
       if (!existsSync(path)) continue;
@@ -124,7 +127,6 @@ export function bwrapArgs(spec: Spec): string[] {
       else args.push("--ro-bind", "/dev/null", path);
     }
   }
-  for (const path of spec.extraReadPaths) if (existsSync(path)) args.push("--ro-bind", path, path);
   // Its own network namespace: nothing gets out, and nothing outside can connect in. "ask" goes through the bridge.
   if (settings.networkOut !== "open") args.push("--unshare-net");
   if (spec.bridge) args.push("--unshare-pid", "--bind", spec.bridge.dir, BRIDGE_MOUNT);

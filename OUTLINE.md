@@ -139,11 +139,15 @@ session. A new session probes again.
 order matters:
 
 - Project-only writes: `(deny file-write*)`, then allow the project,
-  `/private/tmp`, `/private/var/folders`, the sandbox HOME, `extraWritePaths`,
+  `/private/tmp`, `/private/var/folders`, the sandbox HOME,
   `/dev/*`.
 - Protect hooks: deny writes to `.git/hooks`, `.git/config`, `.opencode`, `.envrc`.
-- Credentials: deny read and write on `credentialPaths`; `extraReadPaths` are
-  re-allowed after that.
+- Config lock: `(deny file-write*)` on `lockedPaths` (config folders, state folder,
+  project config files, `homeLinks` targets) after the project allow, then
+  re-allow the sandbox HOME, which sits inside the state folder. Never stored:
+  `lockConfig` is forced on at load and by `toggle`, and left out by `saveProject`.
+  File tools are denied in a `permission` `evaluate` hook (`FILE_WRITE_ACTIONS`).
+- Credentials: deny read and write on `credentialPaths`.
 - Network out not open: deny outbound, allow unix sockets (DNS via
   mDNSResponder), `localhost:*` when the Localhost setting is on, and
   `localhost:<proxyPort>` in ask mode.
@@ -153,10 +157,10 @@ order matters:
 
 ### Linux: bubblewrap (`bwrapArgs`)
 
-- Project-only writes: `--ro-bind / /`, `--tmpfs /tmp`, `--bind` project, HOME,
-  `extraWritePaths`; otherwise `--bind / /`. Then `--dev`, `--proc`.
+- Project-only writes: `--ro-bind / /`, `--tmpfs /tmp`, `--bind` project, HOME;
+  otherwise `--bind / /`. Then `--dev`, `--proc`.
 - Protected paths `--ro-bind` over themselves; credential dirs get `--tmpfs`,
-  files `--ro-bind /dev/null`; `extraReadPaths` re-bound read-only last.
+  files `--ro-bind /dev/null`.
 - Network out not open: `--unshare-net` (own empty namespace). That is why
   **network in and out are linked** (`linkedNetwork`, `linkNetwork`, `adjust(…, linked)`):
   open out = open in, ask/closed out = closed in. Localhost inside is the
