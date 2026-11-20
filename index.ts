@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { backendFor, type Backend, type Spec } from "./src/backend.ts";
 import { BRIDGE_SOCKET, findForwarder, prepareBridge } from "./src/bridge.ts";
 import { matchesName, proxyEnv, sandboxServer } from "./src/mcp.ts";
-import { adjust, linkNetwork, resolveOptions, SETTING_ROWS, type Options, type SettingKey } from "./src/options.ts";
+import { adjust, fillSettings, linkNetwork, resolveOptions, SETTING_ROWS, type Options, type SettingKey } from "./src/options.ts";
 import { expandHome, isInside, linkIntoHome, lockedPaths, projectHash, real, stateDir } from "./src/paths.ts";
 import { exact, isValid, judge } from "./src/patterns.ts";
 import { startProxy, type Proxy } from "./src/proxy.ts";
@@ -143,7 +143,7 @@ export default Plugin.define({
     shared.copies ??= [];
     shared.options = options;
     // Projects cached by an earlier copy (a hot reload keeps them) start locked again, like after a restart.
-    for (const state of shared.projects.values()) state.settings = { ...state.settings, lockConfig: true };
+    for (const state of shared.projects.values()) state.settings = { ...fillSettings(state.settings, options.defaults), lockConfig: true };
     shared.backend = backendFor(process.platform);
     const latest = () => shared.copies.at(-1);
     const emit = (event: string, payload: Record<string, unknown>) => latest()?.emit(event, payload);
@@ -154,6 +154,8 @@ export default Plugin.define({
         state = loadProject(directory, shared.options ?? options);
         if (shared.backend?.linkedNetwork) state.settings = linkNetwork(state.settings);
         shared.projects.set(directory, state);
+      } else if (Object.keys(state.settings).length < Object.keys((shared.options ?? options).defaults).length) {
+        state.settings = fillSettings(state.settings, (shared.options ?? options).defaults);
       }
       return state;
     };

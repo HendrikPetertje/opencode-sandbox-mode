@@ -5,7 +5,7 @@ import { createServer, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bwrapArgs, seatbelt, seatbeltProfile, type Spec } from "./backend.ts";
-import { adjust, parseOptions, resolveOptions, SETTING_ROWS, stripJsonc } from "./options.ts";
+import { adjust, fillSettings, parseOptions, resolveOptions, SETTING_ROWS, stripJsonc } from "./options.ts";
 import { linkIntoHome, lockedPaths } from "./paths.ts";
 import { matchesName, sandboxServer } from "./mcp.ts";
 import { FRESH_MS, listSandboxes, readLive, removeLive, writeLive } from "./sandboxes.ts";
@@ -358,6 +358,9 @@ describe("remove sandbox files", () => {
     expect(SETTING_ROWS.at(-1)).toMatchObject({ key: "sandboxes", label: "List all sandboxes" });
     expect("removeFiles" in settings).toBe(false);
   });
+  test("the sandbox list row leaves the colour legend to the list itself", () => {
+    expect(SETTING_ROWS.at(-1)?.description).not.toMatch(/yellow/i);
+  });
   test("the description does not mention when the row is available", () => {
     expect(SETTING_ROWS.at(-2)?.description).not.toMatch(/only shown|hidden/i);
   });
@@ -461,6 +464,13 @@ describe("MCP access to the project", () => {
     expect(profile).toContain('(subpath "/work/proj/.opencode")');
     // The server's own folder (inside the locked state folder) stays writable.
     expect(lines[lines.findIndex((line) => line.includes("(deny file-write* (subpath") && line.includes("/work/proj/opencode.jsonc")) + 1]).toContain(server.environment!.HOME);
+  });
+  test("settings cached before a setting existed get its default, not undefined", () => {
+    const { mcpProjectWrite: _missing, ...old } = { ...settings, networkOut: "closed" as const };
+    const filled = fillSettings(old, settings);
+    expect(filled.mcpProjectWrite).toBe(false);
+    expect(filled.networkOut).toBe("closed");
+    expect(adjust(filled, "mcpProjectWrite", 1).mcpProjectWrite).toBe(true);
   });
   test("the setting is a per-project boolean row, off by default", () => {
     expect(settings.mcpProjectWrite).toBe(false);

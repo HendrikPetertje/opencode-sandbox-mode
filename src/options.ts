@@ -141,6 +141,12 @@ export function parseOptions(raw: Record<string, unknown> | undefined): Options 
   };
 }
 
+/**
+ * Settings from an older copy of the plugin (cached in memory across a hot reload) lack the keys added since;
+ * those take their default instead of `undefined`.
+ */
+export const fillSettings = (settings: Partial<ProjectSettings>, defaults: ProjectSettings): ProjectSettings => ({ ...defaults, ...settings });
+
 export type SettingKey = Exclude<keyof ProjectSettings, "enabled">;
 
 export interface SettingRow {
@@ -184,7 +190,7 @@ export const SETTING_ROWS: SettingRow[] = [
     key: "sandboxes",
     label: "List all sandboxes",
     description:
-      "Every sandbox on this machine, also those of projects you are not in. Shows which are in use, and wipes the inactive ones, for example when a project folder was removed. Folders that no longer exist are yellow.",
+      "Every sandbox on this machine, also those of projects you are not in. Shows which are in use, and wipes the inactive ones, for example when a project folder was removed.",
   },
 ];
 

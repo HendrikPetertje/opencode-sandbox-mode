@@ -63,6 +63,8 @@ const MODAL_MARGIN = 2;
 /** OpenCode's dialog adds one row of top padding around the plugin's content. */
 const DIALOG_CHROME = 1;
 const MODAL_MIN = 10;
+/** From this terminal width the settings modal uses the wider dialog size. */
+const WIDE_MODAL_MIN_COLUMNS = 124;
 const DOUBLE_TAP_MS = 600;
 
 // Terminal palette slots, so Ghostty's Rosé Pine (or any theme) supplies the
@@ -278,13 +280,14 @@ export default Plugin.define({
     const open = (sessionID: string | undefined, view?: ListView, selected = 0, sandboxEntry?: number) => {
       void refresh(sessionID);
       context.ui.dialog.show(() => <Modal sessionID={sessionID} view={view} selected={selected} sandboxEntry={sandboxEntry} />);
-      context.ui.dialog.set({ size: "large", centered: true });
     };
 
     const Modal = (props: { sessionID: string | undefined; view?: ListView; selected: number; sandboxEntry?: number }) => {
       const ctx = usePlugin();
       const dims = useTerminalDimensions();
       const height = () => Math.max(MODAL_MIN, Math.min(26, dims().height - 2 * MODAL_MARGIN - DIALOG_CHROME));
+      // Wider when the terminal has room (also when it is resized); the label column and the lists need it.
+      createEffect(() => context.ui.dialog.set({ size: dims().width >= WIDE_MODAL_MIN_COLUMNS ? "xlarge" : "large", centered: true }));
       const state = () => store.states[key(props.sessionID)];
       const [view, setView] = createSignal<ListView | undefined>(props.view);
       const [row, setRow] = createSignal(props.view ? 0 : props.selected);
@@ -534,7 +537,10 @@ export default Plugin.define({
       const valueText = (setting: SettingRow) => {
         if (setting.key === "openState") return stateFolderLabel();
         if (setting.key === "removeFiles") return on() ? "disabled" : state()?.files?.exists ? "›" : "nothing to remove";
-        if (setting.key === "sandboxes") return `${state()?.sandboxCount ?? 0} ›`;
+        if (setting.key === "sandboxes") {
+          const count = state()?.sandboxCount ?? 0;
+          return `${count} ${count === 1 ? "entry" : "entries"} ›`;
+        }
         const list = listKey(setting.key);
         if (list) {
           const count = state()?.lists[list.scope][list.kind].length ?? 0;
